@@ -1,0 +1,1 @@
+"""LeadTriage FastAPI application."""

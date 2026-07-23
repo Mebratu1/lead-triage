@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lead-triage"
+version = "0.1.0"
+description = "AI-powered Lead Classification API"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+dependencies = [
+    "fastapi==0.139.2",
+    "uvicorn[standard]==0.51.0",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "supabase==2.31.0",
+    "openai==1.109.1",
+    "python-dotenv==1.2.2",
+    "python-multipart==0.0.32",
+    "email-validator==2.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "pytest==8.4.2",
+    "pytest-cov==7.1.0",
+    "pytest-env==1.2.0",
+    "black==23.12.0",
+    "ruff==0.1.8",
+    "mypy==1.7.1",
+]
