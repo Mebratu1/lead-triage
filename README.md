@@ -1,324 +1,167 @@
-# LeadTriage - AI-Powered Lead Classification API
+# LeadTriage
 
-Production-ready portfolio project demonstrating modern Python backend development.
+LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead-classification API. The current implementation is intentionally limited to the aligned HTTP contract and infrastructure needed before adding idempotency, persistence, and AI classification.
 
-## Overview
+## Current Status
 
-LeadTriage is an intelligent lead management system that:
+- FastAPI project scaffold complete
+- Health endpoints complete
+- Supabase configuration complete
+- Database schema complete
+- Lead request contract aligned
+- AI classification not yet connected
+- Lead persistence not yet connected
+- Idempotency processing not yet connected
 
-- **Receives** incoming sales leads via REST API
-- **Validates** all requests using Pydantic
-- **Deduplicates** leads to prevent duplicate processing (7-day window)
-- **Classifies** leads using OpenAI GPT-4 with intelligent scoring (0-100)
-- **Stores** lead data in Supabase PostgreSQL
-- **Exposes** REST APIs for ingestion and retrieval
-- **Deploys** to Vercel as serverless functions
+## Runtime
 
-## Tech Stack
+LeadTriage targets Python `>=3.12,<3.13`.
 
-- **Framework**: FastAPI (Python 3.12)
-- **Database**: Supabase (PostgreSQL)
-- **LLM**: OpenAI GPT-4 Turbo
-- **Validation**: Pydantic v2
-- **Testing**: pytest + Starlette TestClient
-- **Deployment**: Vercel
+The repository includes `.python-version` with:
 
-## Runtime Requirement
-
-LeadTriage targets Python 3.12 only: `>=3.12,<3.13`.
-
-The `.python-version` file pins local tooling to Python 3.12. The current Windows workstation is temporarily validating with Python 3.14.3 until Python 3.12 is installed.
-
-## Architecture
-
-### Folder Structure
-
-```
-lead-triage/
-├── app/
-│   ├── main.py              # FastAPI application
-│   ├── config.py            # Configuration management
-│   ├── db/
-│   │   ├── client.py        # Supabase client
-│   │   └── migrations/      # Database schemas
-│   ├── models/
-│   │   ├── lead.py          # Domain model
-│   │   └── schemas.py       # Request/response models
-│   ├── services/
-│   │   ├── lead_service.py  # Lead orchestration
-│   │   ├── classifier.py    # LLM classification
-│   │   └── dedup.py         # Deduplication logic
-│   └── routes/
-│       ├── health.py        # Health check
-│       └── leads.py         # Lead endpoints
-├── tests/
-│   ├── conftest.py          # Pytest fixtures
-│   ├── test_leads.py        # API tests
-│   ├── test_classifier.py   # Classifier tests
-│   └── test_dedup.py        # Dedup tests
-└── scripts/
-    └── setup_db.py          # Database setup
+```text
+3.12
 ```
 
-### Data Flow
+The current workstation may temporarily run tests with Python 3.14.3 until Python 3.12 is installed. Do not claim full Python 3.12 verification until the suite passes under Python 3.12.
 
+## API
+
+### Health
+
+```http
+GET /health
+GET /health/database
 ```
-1. POST /leads/ingest
-   ↓
-2. Pydantic validation
-   ↓
-3. Duplicate check (email/phone)
-   ↓
-4. If duplicate: mark as duplicate, link to original
-   ↓
-5. If new: LLM classification (GPT-4)
-   ↓
-6. Store in Supabase + audit log
-   ↓
-7. Return classified lead
+
+`GET /health/database` performs a read-only Supabase query against the `leads` table. Tests override the database dependency with a mock.
+
+### Lead Inquiry Contract
+
+```http
+POST /api/leads
 ```
+
+Request:
+
+```json
+{
+  "source": "website",
+  "message": "I need emergency plumbing service today. Please call me at 301-555-0144."
+}
+```
+
+Rules:
+
+- `source` is optional and defaults to `website`
+- `source` length must be 2 to 50 characters
+- `message` is required
+- `message` length must be 10 to 5000 characters
+- leading and trailing whitespace is trimmed
+- unsupported extra fields are rejected
+
+Temporary response:
+
+```json
+{
+  "status": "accepted",
+  "source": "website",
+  "message": "I need emergency plumbing service today. Please call me at 301-555-0144.",
+  "classification_status": "pending"
+}
+```
+
+The endpoint returns `202 Accepted`. It validates the public contract only. It does not persist the lead, call OpenAI, generate an idempotency key, or create fake classification data yet.
+
+## Database
+
+The migration in `app/db/migrations/001_init_schema.sql` defines the future `leads` table shape:
+
+- `id`
+- `idempotency_key`
+- `source`
+- `raw_message`
+- `customer_name`
+- `email`
+- `phone`
+- `requested_service`
+- `urgency`
+- `lead_score`
+- `ai_summary`
+- `classification_status`
+- `created_at`
+
+The request field `message` maps later to `raw_message` when persistence is connected.
+
+Do not run destructive migrations automatically. Apply the SQL manually in the Supabase SQL Editor when ready.
 
 ## Setup
 
-### 1. Environment Variables
+Install Python 3.12 on Windows:
 
-```bash
-cp .env.example .env
+```powershell
+winget install Python.Python.3.12
+py -0p
+py -3.12 --version
 ```
 
-Fill in your credentials:
+Create the virtual environment:
 
-```env
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-OPENAI_API_KEY=your-openai-api-key
-JWT_SECRET=<generate-with-python-c-import-secrets-print-secrets-token-urlsafe-32>
+```powershell
+cd "C:\Users\mebbr\OneDrive\Documents\lead-triage"
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
 ```
 
-### 2. Install Dependencies
+Copy environment variables:
 
-```bash
-pip install -e ".[dev]"
+```powershell
+Copy-Item .env.example .env
 ```
 
-### 3. Initialize Database
+Never commit `.env` or service-role keys.
 
-```bash
-python scripts/setup_db.py
+## Development Verification
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -ra -W default
 ```
 
-Then manually execute the SQL in Supabase SQL Editor, or use:
+Run locally:
 
-```bash
-# For Supabase admin
-psql postgresql://postgres:password@your-db.supabase.co:5432/postgres \
-  -f app/db/migrations/001_init_schema.sql
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-## Running
+Test the aligned lead contract:
 
-### Development Server
+```powershell
+$body = @{
+    source = "website"
+    message = "I need emergency plumbing service today."
+} | ConvertTo-Json
 
-```bash
-uvicorn app.main:app --reload --port 8000
+Invoke-RestMethod `
+    -Method Post `
+    -Uri http://127.0.0.1:8000/api/leads `
+    -ContentType "application/json" `
+    -Body $body
 ```
 
-Visit: http://localhost:8000/docs (Swagger UI)
+## Testing Notes
 
-### Testing
+Current API tests are synchronous and use `TestClient`. Service tests are intentionally minimal because repository, OpenAI, idempotency, and persistence behavior belong to later milestones.
 
-```bash
-# All tests
-pytest
+`pytest.ini` disables pytest's cache provider only for this local OneDrive-backed repository because cache creation previously hung. Moving the repository outside a synced OneDrive folder may allow normal pytest caching again.
 
-# With coverage
-pytest --cov=app --cov-report=html
+## Later Milestones
 
-# Specific markers
-pytest -m unit           # Unit tests only
-pytest -m integration    # Integration tests
-pytest -m "not slow"     # Skip slow tests
-```
+Next implementation work should add, in order:
 
-## API Endpoints
-
-### Health Check
-
-```bash
-GET /health
-```
-
-Response:
-```json
-{
-  "status": "ok",
-  "environment": "development",
-  "version": "0.1.0"
-}
-```
-
-### Ingest Lead
-
-```bash
-POST /leads/ingest
-Content-Type: application/json
-
-{
-  "email": "john@example.com",
-  "first_name": "John",
-  "last_name": "Doe",
-  "phone": "+1-555-123-4567",
-  "company": "Acme Corp",
-  "job_title": "Sales Manager"
-}
-```
-
-Response:
-```json
-{
-  "id": "uuid-here",
-  "email": "john@example.com",
-  "first_name": "John",
-  "last_name": "Doe",
-  "lead_score": 85,
-  "status": "qualified",
-  "tags": ["sales_ready", "high_priority"],
-  "is_duplicate": false,
-  "classification_rationale": "...",
-  "received_at": "2026-07-22T11:00:00Z",
-  "classified_at": "2026-07-22T11:00:05Z",
-  "created_at": "2026-07-22T11:00:00Z",
-  "updated_at": "2026-07-22T11:00:00Z"
-}
-```
-
-### Get Lead
-
-```bash
-GET /leads/{lead_id}
-```
-
-## Classification Criteria
-
-Leads are scored 0-100 based on:
-
-- **Fit** to business criteria
-- **Engagement quality** (title, company size, industry)
-- **Budget signals** (company size, type)
-- **Decision-making authority**
-- **Timeline urgency**
-
-Statuses:
-- `qualified`: 80-100 (ready for sales)
-- `needs_nurture`: 60-79 (good potential)
-- `low_value`: 0-59 (not qualified)
-
-Tags:
-- `sales_ready`: Immediate outreach
-- `needs_nurture`: Follow-up sequence
-- `high_priority`: VIP account
-- `spam`: Invalid/suspicious
-- `low_value`: Not worth effort
-
-## Key Design Decisions
-
-### 1. **Asynchronous Processing**
-
-- All database and LLM calls are async (FastAPI + AsyncClient)
-- Enables high throughput, low latency
-- Production-ready for serverless deployment
-
-### 2. **Deduplication Window**
-
-- 7-day window (configurable)
-- Prevents duplicate processing within recent history
-- Maintains audit trail of duplicates
-
-### 3. **LLM Prompting Strategy**
-
-- Detailed system prompt with classification criteria
-- Strict JSON response format for reliability
-- Fallback to `processing_error` status if classification fails
-- Configurable model (defaults to GPT-4 Turbo)
-
-### 4. **Database Schema**
-
-- Normalized tables: `leads`, `lead_tags`, `classification_history`, `duplicate_log`
-- Audit trail via `classification_history` and `duplicate_log`
-- Full-text search indexes on email, status, score
-- Row-level security (RLS) for multi-tenant deployments
-- Automatic `updated_at` timestamp via trigger
-
-### 5. **Error Handling**
-
-- Graceful degradation: leads stored even if LLM classification fails
-- Detailed audit logging for troubleshooting
-- Structured error responses with HTTP status codes
-
-## Testing Strategy
-
-### Unit Tests
-- Pydantic model validation
-- LLM response parsing
-- Deduplication logic
-
-### Integration Tests
-- End-to-end lead ingestion
-- Database operations
-- LLM classification (mocked)
-
-### Test Markers
-```bash
-pytest -m unit           # Fast, no external deps
-pytest -m integration    # Requires Supabase/OpenAI
-pytest -m slow           # Long-running tests
-```
-
-## Deployment
-
-### Vercel
-
-```bash
-vercel
-```
-
-Configure environment variables in Vercel dashboard.
-
-### Docker
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY pyproject.toml .
-RUN pip install -e .
-COPY app/ ./app/
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-```bash
-docker build -t leadtriage .
-docker run -p 8000:8000 --env-file .env leadtriage
-```
-
-## Interview Talking Points
-
-1. **Async Architecture**: Why async/await, how it scales
-2. **Deduplication**: Trade-offs between precision and recall
-3. **LLM Integration**: Prompt engineering, error handling, cost optimization
-4. **Database Design**: Normalization, indexing, audit trails
-5. **Testing**: Unit vs integration, fixture patterns, markers
-6. **Error Handling**: Graceful degradation, observability
-7. **Deployment**: Serverless vs containerized, configuration management
-
-## Project Milestones
-
-- ✅ **Milestone 1**: Project Setup & Database Schema
-- 📋 **Milestone 2**: Lead Ingestion Service (API + Validation)
-- 📋 **Milestone 3**: Deduplication & Classification
-- 📋 **Milestone 4**: Advanced Filtering & Analytics
-- 📋 **Milestone 5**: Production Hardening & Deployment
-
-## License
-
-MIT
+1. Typed classified lead output contracts
+2. Deterministic idempotency key generation and lookup
+3. OpenAI-compatible structured classification
+4. Supabase persistence using `raw_message`
+5. Vercel deployment configuration

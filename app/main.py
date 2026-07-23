@@ -8,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db.client import SupabaseClient
-from app.routes import health, leads
+from app.api.routes import leads
+from app.routes import health
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -21,7 +22,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"Starting LeadTriage API (environment: {settings.environment})")
     logger.info("Supabase configured: %s", bool(settings.supabase_url))
-    logger.info("OpenAI model configured: %s", bool(settings.openai_model))
+    logger.info("Lead classification connected: False")
     yield
     # Shutdown
     logger.info("Shutting down LeadTriage API")
@@ -48,7 +49,7 @@ def create_app() -> FastAPI:
 
     # Register routes
     app.include_router(health.router)
-    app.include_router(leads.router)
+    app.include_router(leads.router, prefix="/api")
 
     logger.info("FastAPI application created successfully")
     return app
