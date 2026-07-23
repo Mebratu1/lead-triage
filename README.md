@@ -1,6 +1,6 @@
 # LeadTriage
 
-LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead-classification API. The current implementation is intentionally limited to the aligned HTTP contract and infrastructure needed before adding idempotency, persistence, and AI classification.
+LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classification API. The current implementation accepts unstructured lead inquiries, persists them to Supabase, and deduplicates repeat submissions before later AI classification work is added.
 
 ## Current Status
 
@@ -9,9 +9,10 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead-classi
 - Supabase configuration complete
 - Database schema complete
 - Lead request contract aligned
+- Lead persistence connected
+- Idempotency processing connected
 - AI classification not yet connected
-- Lead persistence not yet connected
-- Idempotency processing not yet connected
+- Queue and CRM integrations not yet connected
 
 ## Runtime
 
@@ -60,22 +61,50 @@ Rules:
 - leading and trailing whitespace is trimmed
 - unsupported extra fields are rejected
 
-Temporary response:
+Created response:
 
 ```json
 {
   "status": "accepted",
+  "id": "7d5c90ff-3cb0-4c16-a0fb-6af5e8988d4f",
   "source": "website",
-  "message": "I need emergency plumbing service today. Please call me at 301-555-0144.",
-  "classification_status": "pending"
+  "classification_status": "pending",
+  "persistence_status": "created"
 }
 ```
 
-The endpoint returns `202 Accepted`. It validates the public contract only. It does not persist the lead, call OpenAI, generate an idempotency key, or create fake classification data yet.
+Duplicate response:
+
+```json
+{
+  "status": "accepted",
+  "id": "7d5c90ff-3cb0-4c16-a0fb-6af5e8988d4f",
+  "source": "website",
+  "classification_status": "pending",
+  "persistence_status": "deduplicated"
+}
+```
+
+The endpoint returns `202 Accepted`. It saves the lead with `classification_status = "pending"` and returns the existing saved lead for duplicate submissions. It does not call OpenAI, generate fake classification values, enqueue background work, or push to a CRM.
+
+## Idempotency
+
+The API builds a deterministic idempotency key from normalized input:
+
+```text
+lead:v1 + normalized source + normalized message
+```
+
+Normalization:
+
+- `source`: trim and lowercase
+- `message`: trim and collapse whitespace runs to a single space
+
+The normalized values are hashed with SHA-256. The database enforces uniqueness on `leads.idempotency_key`.
 
 ## Database
 
-The migration in `app/db/migrations/001_init_schema.sql` defines the future `leads` table shape:
+The migration in `app/db/migrations/001_init_schema.sql` defines the `leads` table shape:
 
 - `id`
 - `idempotency_key`
@@ -91,9 +120,15 @@ The migration in `app/db/migrations/001_init_schema.sql` defines the future `lea
 - `classification_status`
 - `created_at`
 
-The request field `message` maps later to `raw_message` when persistence is connected.
+The request field `message` is stored as `raw_message`.
 
-Do not run destructive migrations automatically. Apply the SQL manually in the Supabase SQL Editor when ready.
+Do not run destructive migrations automatically. Apply the SQL manually in the Supabase SQL Editor when needed.
+
+## Supabase Keys
+
+Server-side database access uses `SUPABASE_SERVICE_ROLE_KEY`.
+
+Do not expose the service-role key to frontend code, API responses, logs, screenshots, source control, or client-side environment variables. The current backend does not require `SUPABASE_KEY` for database access.
 
 ## Setup
 
@@ -135,7 +170,7 @@ Run locally:
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Test the aligned lead contract:
+Test the persisted lead contract:
 
 ```powershell
 $body = @{
@@ -152,7 +187,7 @@ Invoke-RestMethod `
 
 ## Testing Notes
 
-Current API tests are synchronous and use `TestClient`. Service tests are intentionally minimal because repository, OpenAI, idempotency, and persistence behavior belong to later milestones.
+Current API tests are synchronous and use `TestClient`. Database behavior is tested with stateful Supabase fakes so the unit suite does not need live credentials or network access.
 
 `pytest.ini` disables pytest's cache provider only for this local OneDrive-backed repository because cache creation previously hung. Moving the repository outside a synced OneDrive folder may allow normal pytest caching again.
 
@@ -161,7 +196,7 @@ Current API tests are synchronous and use `TestClient`. Service tests are intent
 Next implementation work should add, in order:
 
 1. Typed classified lead output contracts
-2. Deterministic idempotency key generation and lookup
-3. OpenAI-compatible structured classification
-4. Supabase persistence using `raw_message`
+2. OpenAI-compatible structured classification
+3. Persistence of classified fields
+4. Queue or background processing if classification becomes slow
 5. Vercel deployment configuration

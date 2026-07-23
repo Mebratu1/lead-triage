@@ -49,7 +49,9 @@ async def database_health_check(
     """Check that the configured Supabase client can query the leads table."""
     try:
         query = await _resolve(db.table("leads"))
-        query = await _resolve(query.select("id"))
+        query = await _resolve(
+            query.select("id,idempotency_key,source,raw_message,classification_status")
+        )
         query = await _resolve(query.limit(1))
         await _resolve(query.execute())
     except Exception as exc:

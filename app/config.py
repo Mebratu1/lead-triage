@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # Supabase
     supabase_url: str
-    supabase_key: str
+    supabase_key: str | None = None
     supabase_service_role_key: str
 
     # OpenAI

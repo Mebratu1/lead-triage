@@ -1,6 +1,7 @@
-"""Lead request and temporary response models."""
+"""Lead request and response models."""
 
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -42,22 +43,24 @@ class LeadCreateRequest(BaseModel):
         return value
 
 
-class LeadAcceptedResponse(BaseModel):
-    """Temporary response while classification and persistence are deferred."""
+class LeadPersistedResponse(BaseModel):
+    """Response for an idempotently persisted lead inquiry."""
 
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
             "example": {
                 "status": "accepted",
+                "id": "7d5c90ff-3cb0-4c16-a0fb-6af5e8988d4f",
                 "source": "website",
-                "message": "I need emergency plumbing service today.",
                 "classification_status": "pending",
+                "persistence_status": "created",
             }
         },
     )
 
     status: Literal["accepted"] = "accepted"
+    id: UUID
     source: str
-    message: str
     classification_status: Literal["pending"] = "pending"
+    persistence_status: Literal["created", "deduplicated"]
