@@ -65,11 +65,11 @@ Created response:
 
 ```json
 {
-  "status": "accepted",
   "id": "7d5c90ff-3cb0-4c16-a0fb-6af5e8988d4f",
   "source": "website",
+  "created_at": "2026-07-23T12:34:56Z",
   "classification_status": "pending",
-  "persistence_status": "created"
+  "duplicate": false
 }
 ```
 
@@ -77,22 +77,22 @@ Duplicate response:
 
 ```json
 {
-  "status": "accepted",
   "id": "7d5c90ff-3cb0-4c16-a0fb-6af5e8988d4f",
   "source": "website",
+  "created_at": "2026-07-23T12:34:56Z",
   "classification_status": "pending",
-  "persistence_status": "deduplicated"
+  "duplicate": true
 }
 ```
 
-The endpoint returns `202 Accepted`. It saves the lead with `classification_status = "pending"` and returns the existing saved lead for duplicate submissions. It does not call OpenAI, generate fake classification values, enqueue background work, or push to a CRM.
+The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a duplicate that returns an existing lead. It saves the lead with `classification_status = "pending"` and does not echo the full raw customer message. It does not call OpenAI, generate fake classification values, enqueue background work, or push to a CRM.
 
 ## Idempotency
 
-The API builds a deterministic idempotency key from normalized input:
+The API builds a deterministic idempotency key with SHA-256:
 
 ```text
-lead:v1 + normalized source + normalized message
+SHA-256(normalized_source + "\n" + normalized_message)
 ```
 
 Normalization:
@@ -100,14 +100,17 @@ Normalization:
 - `source`: trim and lowercase
 - `message`: trim and collapse whitespace runs to a single space
 
-The normalized values are hashed with SHA-256. The database enforces uniqueness on `leads.idempotency_key`.
+The message is not lowercased, punctuation is not removed, numbers are not removed, and customer wording is not semantically rewritten. The original cleaned request text is stored in `raw_message`; the normalized message is only used to derive the hash.
+
+Duplicate detection is scoped by `DEDUP_WINDOW_DAYS`. The service derives a UTC fixed-window `deduplication_bucket` and the database enforces uniqueness on `(idempotency_key, deduplication_bucket)`. This avoids permanent deduplication and allows the same normalized source and message in a later configured window. The tradeoff is fixed bucket boundaries: a repeat near a bucket edge can be accepted sooner than a rolling window, but the rule is deterministic and enforceable with a normal unique index.
 
 ## Database
 
-The migration in `app/db/migrations/001_init_schema.sql` defines the `leads` table shape:
+The migration in `app/db/migrations/001_init_schema.sql` defines the baseline `leads` table shape. The non-destructive migration in `app/db/migrations/002_idempotent_lead_persistence.sql` upgrades older tables and adds windowed idempotency support. The compatibility migration in `app/db/migrations/003_relax_legacy_lead_required_columns.sql` relaxes required legacy customer fields that Milestone 3A intentionally does not populate.
 
 - `id`
 - `idempotency_key`
+- `deduplication_bucket`
 - `source`
 - `raw_message`
 - `customer_name`

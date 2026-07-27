@@ -1,15 +1,24 @@
-"""Idempotent Supabase persistence for lead inquiries."""
+"""Idempotent persistence orchestration for lead inquiries."""
 
 import hashlib
-import inspect
-from typing import Any, Literal
+from datetime import UTC, date, datetime, timedelta
+from typing import Literal
 
 from supabase import AsyncClient
 
+from app.config import settings
 from app.models.lead import LeadCreateRequest, LeadPersistedResponse
+from app.repositories.lead_repository import (
+    LeadRepositoryInsertError,
+    LeadRepositoryLookupError,
+    LeadRepositoryUnexpectedResult,
+    LeadRepositoryUniqueConflict,
+    find_by_idempotency,
+    insert_lead,
+)
 
 CLASSIFICATION_PENDING: Literal["pending"] = "pending"
-IDEMPOTENCY_VERSION = "lead:v1"
+EPOCH_DATE = date(1970, 1, 1)
 
 
 class LeadPersistenceError(Exception):
@@ -21,14 +30,11 @@ class LeadLookupFailed(LeadPersistenceError):
 
 
 class LeadInsertFailed(LeadPersistenceError):
-    """Raised when a lead insert fails."""
+    """Raised when lead insertion fails."""
 
 
-async def _resolve(value: Any) -> Any:
-    """Support real Supabase builders and lightweight test doubles."""
-    if inspect.isawaitable(value):
-        return await value
-    return value
+class LeadUnexpectedPersistenceFailure(LeadPersistenceError):
+    """Raised when persistence returns an unexpected result."""
 
 
 def normalize_source(source: str) -> str:
@@ -42,106 +48,106 @@ def normalize_message(message: str) -> str:
 
 
 def generate_idempotency_key(source: str, message: str) -> str:
-    """Create a deterministic key from normalized lead input."""
+    """Create SHA-256(normalized_source + newline + normalized_message)."""
     normalized_source = normalize_source(source)
     normalized_message = normalize_message(message)
-    digest = hashlib.sha256(
-        f"{IDEMPOTENCY_VERSION}\n{normalized_source}\n{normalized_message}".encode(
-            "utf-8"
-        )
+    return hashlib.sha256(
+        f"{normalized_source}\n{normalized_message}".encode("utf-8")
     ).hexdigest()
-    return f"{IDEMPOTENCY_VERSION}:{digest}"
 
 
-def _first_row(response: Any) -> dict[str, Any] | None:
-    data = getattr(response, "data", None)
-    if isinstance(data, list):
-        return data[0] if data else None
-    if isinstance(data, dict):
-        return data
-    return None
-
-
-def _is_unique_constraint_error(exc: Exception) -> bool:
-    code = getattr(exc, "code", None)
-    if code == "23505":
-        return True
-
-    message = str(exc).lower()
-    return (
-        "23505" in message
-        or "duplicate key" in message
-        or "unique constraint" in message
+def deduplication_bucket_for(
+    moment: datetime | None = None,
+    window_days: int | None = None,
+) -> date:
+    """Return the UTC duplicate-window bucket for the supplied timestamp."""
+    configured_window_days = (
+        settings.dedup_window_days if window_days is None else window_days
     )
+    if configured_window_days < 1:
+        raise ValueError("deduplication window must be at least one day")
+
+    current_moment = moment or datetime.now(UTC)
+    if current_moment.tzinfo is None:
+        current_moment = current_moment.replace(tzinfo=UTC)
+
+    current_date = current_moment.astimezone(UTC).date()
+    days_since_epoch = (current_date - EPOCH_DATE).days
+    bucket_start_days = (
+        days_since_epoch // configured_window_days
+    ) * configured_window_days
+    return EPOCH_DATE + timedelta(days=bucket_start_days)
 
 
-def _to_response(
-    row: dict[str, Any],
-    persistence_status: Literal["created", "deduplicated"],
-) -> LeadPersistedResponse:
+def _to_response(row: dict, duplicate: bool) -> LeadPersistedResponse:
     return LeadPersistedResponse(
         id=row["id"],
         source=row["source"],
         classification_status=row["classification_status"],
-        persistence_status=persistence_status,
+        created_at=row["created_at"],
+        duplicate=duplicate,
     )
 
 
 async def _find_existing_lead(
     db: AsyncClient,
     idempotency_key: str,
-) -> dict[str, Any] | None:
+    deduplication_bucket: date,
+) -> dict | None:
     try:
-        query = await _resolve(db.table("leads"))
-        query = await _resolve(query.select("id,source,classification_status"))
-        query = await _resolve(query.eq("idempotency_key", idempotency_key))
-        query = await _resolve(query.limit(1))
-        response = await _resolve(query.execute())
-    except Exception as exc:
+        return await find_by_idempotency(
+            db=db,
+            idempotency_key=idempotency_key,
+            deduplication_bucket=deduplication_bucket,
+        )
+    except LeadRepositoryLookupError as exc:
         raise LeadLookupFailed from exc
-
-    return _first_row(response)
 
 
 async def persist_lead(
     db: AsyncClient,
     request: LeadCreateRequest,
+    now: datetime | None = None,
 ) -> LeadPersistedResponse:
-    """Persist a lead once, returning existing rows for duplicate submissions."""
+    """Persist a lead once within the configured duplicate window."""
     source = normalize_source(request.source)
     raw_message = request.message
     idempotency_key = generate_idempotency_key(
         source=source,
         message=raw_message,
     )
+    deduplication_bucket = deduplication_bucket_for(moment=now)
 
-    existing_lead = await _find_existing_lead(db, idempotency_key)
+    existing_lead = await _find_existing_lead(
+        db=db,
+        idempotency_key=idempotency_key,
+        deduplication_bucket=deduplication_bucket,
+    )
     if existing_lead is not None:
-        return _to_response(existing_lead, persistence_status="deduplicated")
+        return _to_response(existing_lead, duplicate=True)
 
     payload = {
         "idempotency_key": idempotency_key,
+        "deduplication_bucket": deduplication_bucket.isoformat(),
         "source": source,
         "raw_message": raw_message,
         "classification_status": CLASSIFICATION_PENDING,
     }
 
     try:
-        query = await _resolve(db.table("leads"))
-        query = await _resolve(query.insert(payload))
-        response = await _resolve(query.execute())
-    except Exception as exc:
-        if _is_unique_constraint_error(exc):
-            existing_after_race = await _find_existing_lead(db, idempotency_key)
-            if existing_after_race is not None:
-                return _to_response(
-                    existing_after_race,
-                    persistence_status="deduplicated",
-                )
-        raise LeadInsertFailed from exc
-
-    inserted_lead = _first_row(response)
-    if inserted_lead is None:
+        inserted_lead = await insert_lead(db=db, payload=payload)
+    except LeadRepositoryUniqueConflict:
+        existing_after_race = await _find_existing_lead(
+            db=db,
+            idempotency_key=idempotency_key,
+            deduplication_bucket=deduplication_bucket,
+        )
+        if existing_after_race is not None:
+            return _to_response(existing_after_race, duplicate=True)
         raise LeadInsertFailed
+    except LeadRepositoryInsertError as exc:
+        raise LeadInsertFailed from exc
+    except LeadRepositoryUnexpectedResult as exc:
+        raise LeadUnexpectedPersistenceFailure from exc
 
-    return _to_response(inserted_lead, persistence_status="created")
+    return _to_response(inserted_lead, duplicate=False)

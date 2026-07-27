@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
 from uuid import UUID
@@ -11,7 +13,11 @@ import pytest
 
 from app.db.client import get_db
 from app.models.lead import LeadCreateRequest
-from app.services.lead_persistence import generate_idempotency_key
+from app.services.lead_persistence import (
+    deduplication_bucket_for,
+    generate_idempotency_key,
+    persist_lead,
+)
 
 if TYPE_CHECKING:
     from starlette.testclient import TestClient
@@ -66,14 +72,20 @@ class FakeLeadDatabase:
         fail_lookup: bool = False,
         fail_insert: bool = False,
         race_duplicate_on_insert: bool = False,
+        empty_insert_response: bool = False,
         failure_message: str = "database failure",
     ):
         self.records_by_key = {
-            record["idempotency_key"]: dict(record) for record in records or []
+            self._storage_key(
+                record["idempotency_key"],
+                record["deduplication_bucket"],
+            ): dict(record)
+            for record in records or []
         }
         self.fail_lookup = fail_lookup
         self.fail_insert = fail_insert
         self.race_duplicate_on_insert = race_duplicate_on_insert
+        self.empty_insert_response = empty_insert_response
         self.failure_message = failure_message
         self.lookup_count = 0
         self.insert_count = 0
@@ -88,61 +100,82 @@ class FakeLeadDatabase:
         if self.fail_lookup:
             raise RuntimeError(self.failure_message)
 
-        idempotency_key = filters.get("idempotency_key")
-        record = self.records_by_key.get(idempotency_key)
+        key = self._storage_key(
+            filters.get("idempotency_key"),
+            filters.get("deduplication_bucket"),
+        )
+        record = self.records_by_key.get(key)
         return SimpleNamespace(data=[record] if record else [])
 
     def execute_insert(self, payload: dict[str, Any]):
         self.insert_count += 1
         if self.fail_insert:
             raise RuntimeError(self.failure_message)
+        if self.empty_insert_response:
+            return SimpleNamespace(data=[])
 
-        idempotency_key = payload["idempotency_key"]
+        key = self._storage_key(
+            payload["idempotency_key"],
+            payload["deduplication_bucket"],
+        )
         if self.race_duplicate_on_insert:
-            self.records_by_key[idempotency_key] = self._build_row(
+            self.records_by_key[key] = self._build_row(
                 payload,
                 lead_id="33333333-3333-4333-8333-333333333333",
+                created_at="2026-07-23T16:00:00+00:00",
             )
             self.race_duplicate_on_insert = False
             raise FakeUniqueConstraintError(
-                'duplicate key value violates unique constraint "leads_idempotency_key_key"'
+                'duplicate key value violates unique constraint '
+                '"idx_leads_idempotency_bucket_unique"'
             )
 
-        if idempotency_key in self.records_by_key:
+        if key in self.records_by_key:
             raise FakeUniqueConstraintError(
-                'duplicate key value violates unique constraint "leads_idempotency_key_key"'
+                'duplicate key value violates unique constraint '
+                '"idx_leads_idempotency_bucket_unique"'
             )
 
         row = self._build_row(
             payload,
             lead_id=f"11111111-1111-4111-8111-{self.insert_count:012d}",
+            created_at=f"2026-07-23T16:00:{self.insert_count:02d}+00:00",
         )
-        self.records_by_key[idempotency_key] = row
+        self.records_by_key[key] = row
         self.inserted_payloads.append(dict(payload))
         return SimpleNamespace(data=[row])
 
     @staticmethod
-    def _build_row(payload: dict[str, Any], lead_id: str):
+    def _storage_key(idempotency_key: str, deduplication_bucket: str):
+        return idempotency_key, deduplication_bucket
+
+    @staticmethod
+    def _build_row(payload: dict[str, Any], lead_id: str, created_at: str):
         return {
             "id": lead_id,
             "idempotency_key": payload["idempotency_key"],
+            "deduplication_bucket": payload["deduplication_bucket"],
             "source": payload["source"],
             "raw_message": payload["raw_message"],
             "classification_status": payload["classification_status"],
+            "created_at": created_at,
         }
 
 
 def existing_lead(
     message: str = "I need emergency plumbing service today.",
     source: str = "website",
+    bucket: str = "2026-07-23",
     lead_id: str = "22222222-2222-4222-8222-222222222222",
 ) -> dict[str, Any]:
     return {
         "id": lead_id,
         "idempotency_key": generate_idempotency_key(source=source, message=message),
+        "deduplication_bucket": bucket,
         "source": source,
         "raw_message": message,
         "classification_status": "pending",
+        "created_at": "2026-07-23T15:00:00+00:00",
     }
 
 
@@ -214,7 +247,7 @@ class TestLeadPersistenceContract:
     """Official lead inquiry persistence tests."""
 
     @pytest.mark.unit
-    def test_create_lead_persists_valid_request(self, client: TestClient):
+    def test_create_lead_persists_valid_request_with_201(self, client: TestClient):
         """Test POST /api/leads inserts an unstructured inquiry."""
         database = FakeLeadDatabase()
 
@@ -228,14 +261,14 @@ class TestLeadPersistenceContract:
         )
 
         body = response.json()
-        assert response.status_code == 202
+        assert response.status_code == 201
         assert UUID(body["id"])
         assert body == {
-            "status": "accepted",
             "id": body["id"],
             "source": "website",
             "classification_status": "pending",
-            "persistence_status": "created",
+            "created_at": "2026-07-23T16:00:01Z",
+            "duplicate": False,
         }
         assert database.insert_count == 1
         assert database.inserted_payloads == [
@@ -244,6 +277,7 @@ class TestLeadPersistenceContract:
                     source="website",
                     message="I need emergency plumbing service today.",
                 ),
+                "deduplication_bucket": deduplication_bucket_for().isoformat(),
                 "source": "website",
                 "raw_message": "I need emergency plumbing service today.",
                 "classification_status": "pending",
@@ -251,9 +285,10 @@ class TestLeadPersistenceContract:
         ]
 
     @pytest.mark.unit
-    def test_create_lead_returns_existing_duplicate(self, client: TestClient):
+    def test_create_lead_returns_exact_duplicate_with_200(self, client: TestClient):
         """Test duplicate requests return the saved lead without reinserting."""
-        existing = existing_lead()
+        bucket = deduplication_bucket_for().isoformat()
+        existing = existing_lead(bucket=bucket)
         database = FakeLeadDatabase(records=[existing])
 
         response = post_lead(
@@ -265,19 +300,19 @@ class TestLeadPersistenceContract:
             },
         )
 
-        assert response.status_code == 202
+        assert response.status_code == 200
         assert response.json() == {
-            "status": "accepted",
             "id": existing["id"],
             "source": "website",
             "classification_status": "pending",
-            "persistence_status": "deduplicated",
+            "created_at": "2026-07-23T15:00:00Z",
+            "duplicate": True,
         }
         assert database.insert_count == 0
 
     @pytest.mark.unit
-    def test_create_lead_deduplicates_normalized_request(self, client: TestClient):
-        """Test source casing and message spacing do not bypass idempotency."""
+    def test_create_lead_deduplicates_outer_whitespace(self, client: TestClient):
+        """Test outer whitespace does not bypass idempotency."""
         database = FakeLeadDatabase()
 
         first_response = post_lead(
@@ -292,24 +327,169 @@ class TestLeadPersistenceContract:
             client,
             database,
             {
-                "source": " WEBSITE ",
-                "message": "  Please   contact me about emergency plumbing.  ",
+                "source": " website ",
+                "message": "  Please contact me about emergency plumbing.  ",
             },
         )
 
-        assert first_response.status_code == 202
-        assert second_response.status_code == 202
-        assert first_response.json()["persistence_status"] == "created"
-        assert second_response.json()["persistence_status"] == "deduplicated"
+        assert first_response.status_code == 201
+        assert second_response.status_code == 200
+        assert second_response.json()["duplicate"] is True
         assert second_response.json()["id"] == first_response.json()["id"]
         assert database.insert_count == 1
 
     @pytest.mark.unit
-    def test_create_lead_handles_database_insertion_failure(self, client: TestClient):
+    def test_create_lead_deduplicates_repeated_internal_whitespace(
+        self,
+        client: TestClient,
+    ):
+        """Test repeated internal whitespace does not bypass idempotency."""
+        database = FakeLeadDatabase()
+
+        first_response = post_lead(
+            client,
+            database,
+            {
+                "source": "website",
+                "message": "Please contact me about emergency plumbing.",
+            },
+        )
+        second_response = post_lead(
+            client,
+            database,
+            {
+                "source": "website",
+                "message": "Please   contact   me about emergency plumbing.",
+            },
+        )
+
+        assert first_response.status_code == 201
+        assert second_response.status_code == 200
+        assert second_response.json()["id"] == first_response.json()["id"]
+        assert database.insert_count == 1
+
+    @pytest.mark.unit
+    def test_create_lead_deduplicates_source_case(self, client: TestClient):
+        """Test source case differences do not bypass idempotency."""
+        database = FakeLeadDatabase()
+
+        first_response = post_lead(
+            client,
+            database,
+            {
+                "source": "Website",
+                "message": "Please contact me about emergency plumbing.",
+            },
+        )
+        second_response = post_lead(
+            client,
+            database,
+            {
+                "source": "WEBSITE",
+                "message": "Please contact me about emergency plumbing.",
+            },
+        )
+
+        assert first_response.status_code == 201
+        assert second_response.status_code == 200
+        assert second_response.json()["id"] == first_response.json()["id"]
+        assert database.insert_count == 1
+
+    @pytest.mark.unit
+    def test_meaningful_punctuation_differences_are_distinct(self, client: TestClient):
+        """Test punctuation changes are not normalized away."""
+        database = FakeLeadDatabase()
+
+        first_response = post_lead(
+            client,
+            database,
+            {"message": "Please call me about plumbing."},
+        )
+        second_response = post_lead(
+            client,
+            database,
+            {"message": "Please call me about plumbing!"},
+        )
+
+        assert first_response.status_code == 201
+        assert second_response.status_code == 201
+        assert second_response.json()["id"] != first_response.json()["id"]
+        assert database.insert_count == 2
+
+    @pytest.mark.unit
+    def test_meaningful_number_differences_are_distinct(self, client: TestClient):
+        """Test number changes are not normalized away."""
+        database = FakeLeadDatabase()
+
+        first_response = post_lead(
+            client,
+            database,
+            {"message": "Please call me at 301 555 0144."},
+        )
+        second_response = post_lead(
+            client,
+            database,
+            {"message": "Please call me at 301 555 0145."},
+        )
+
+        assert first_response.status_code == 201
+        assert second_response.status_code == 201
+        assert second_response.json()["id"] != first_response.json()["id"]
+        assert database.insert_count == 2
+
+    @pytest.mark.unit
+    def test_same_message_outside_deduplication_window_is_new(self):
+        """Test configured buckets allow repeat messages after the window."""
+        database = FakeLeadDatabase()
+        request = LeadCreateRequest(
+            source="website",
+            message="Please contact me about emergency plumbing.",
+        )
+
+        first_response = asyncio.run(
+            persist_lead(
+                db=database,
+                request=request,
+                now=datetime(2026, 7, 23, 12, tzinfo=UTC),
+            )
+        )
+        second_response = asyncio.run(
+            persist_lead(
+                db=database,
+                request=request,
+                now=datetime(2026, 7, 30, 12, tzinfo=UTC),
+            )
+        )
+
+        assert first_response.duplicate is False
+        assert second_response.duplicate is False
+        assert second_response.id != first_response.id
+        assert database.insert_count == 2
+
+    @pytest.mark.unit
+    def test_idempotency_key_uses_expected_sha256_policy(self):
+        """Test exact normalization and hashing policy."""
+        expected = hashlib.sha256(
+            "website\nPlease contact me about emergency plumbing.".encode("utf-8")
+        ).hexdigest()
+
+        assert (
+            generate_idempotency_key(
+                source=" WEBSITE ",
+                message="  Please   contact me about emergency plumbing.  ",
+            )
+            == expected
+        )
+
+    @pytest.mark.unit
+    def test_create_lead_handles_database_insertion_failure_safely(
+        self,
+        client: TestClient,
+    ):
         """Test insert failures return a safe service error."""
         database = FakeLeadDatabase(
             fail_insert=True,
-            failure_message="insert failed with test-service-role-key",
+            failure_message="insert failed with test-service-role-key and SQL details",
         )
 
         response = post_lead(
@@ -324,13 +504,17 @@ class TestLeadPersistenceContract:
         assert response.status_code == 503
         assert response.json() == {"detail": "Lead persistence failed"}
         assert "test-service-role-key" not in response.text
+        assert "SQL details" not in response.text
 
     @pytest.mark.unit
-    def test_create_lead_handles_database_lookup_failure(self, client: TestClient):
+    def test_create_lead_handles_database_lookup_failure_safely(
+        self,
+        client: TestClient,
+    ):
         """Test lookup failures return a safe service error."""
         database = FakeLeadDatabase(
             fail_lookup=True,
-            failure_message="lookup failed with test-service-role-key",
+            failure_message="lookup failed with test-service-role-key and SQL details",
         )
 
         response = post_lead(
@@ -345,6 +529,27 @@ class TestLeadPersistenceContract:
         assert response.status_code == 503
         assert response.json() == {"detail": "Lead persistence failed"}
         assert "test-service-role-key" not in response.text
+        assert "SQL details" not in response.text
+
+    @pytest.mark.unit
+    def test_create_lead_handles_unexpected_insert_result_safely(
+        self,
+        client: TestClient,
+    ):
+        """Test unexpected persistence failures return a safe 500."""
+        database = FakeLeadDatabase(empty_insert_response=True)
+
+        response = post_lead(
+            client,
+            database,
+            {
+                "source": "website",
+                "message": "Please contact me about emergency plumbing.",
+            },
+        )
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Lead persistence failed"}
 
     @pytest.mark.unit
     def test_create_lead_handles_unique_constraint_race(self, client: TestClient):
@@ -360,13 +565,13 @@ class TestLeadPersistenceContract:
             },
         )
 
-        assert response.status_code == 202
+        assert response.status_code == 200
         assert response.json() == {
-            "status": "accepted",
             "id": "33333333-3333-4333-8333-333333333333",
             "source": "website",
             "classification_status": "pending",
-            "persistence_status": "deduplicated",
+            "created_at": "2026-07-23T16:00:00Z",
+            "duplicate": True,
         }
         assert database.lookup_count == 2
         assert database.insert_count == 1
@@ -402,7 +607,7 @@ class TestLeadPersistenceContract:
             {"message": "Please contact me about emergency plumbing."},
         )
 
-        assert response.status_code == 202
+        assert response.status_code == 201
         assert response.json()["source"] == "website"
 
     @pytest.mark.unit
@@ -466,7 +671,7 @@ class TestSupabaseClientConfiguration:
         """Test backend Supabase access does not depend on the anon key."""
         import app.db.client as db_client
 
-        captured: dict[str, str] = {}
+        captured: dict[str, str | None] = {}
 
         async def fake_create_client(supabase_url: str, supabase_key: str):
             captured["supabase_url"] = supabase_url
@@ -474,7 +679,7 @@ class TestSupabaseClientConfiguration:
             return object()
 
         monkeypatch.setattr(db_client, "acreate_client", fake_create_client)
-        monkeypatch.setattr(db_client.settings, "supabase_key", "test-anon-key")
+        monkeypatch.setattr(db_client.settings, "supabase_key", None)
         monkeypatch.setattr(
             db_client.settings,
             "supabase_service_role_key",

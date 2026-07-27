@@ -1,29 +1,34 @@
-"""Print the database migration for manual Supabase setup."""
+"""Print database migrations for manual Supabase setup."""
 
 import sys
 from pathlib import Path
 
-MIGRATION_SQL = Path(__file__).parent.parent / "app" / "db" / "migrations" / "001_init_schema.sql"
+MIGRATIONS_DIR = Path(__file__).parent.parent / "app" / "db" / "migrations"
 
 
-def show_database_migration() -> None:
-    """Print the SQL migration for manual Supabase execution."""
-    if not MIGRATION_SQL.exists():
-        print(f"Migration file not found: {MIGRATION_SQL}")
+def show_database_migrations() -> None:
+    """Print SQL migrations for manual Supabase execution."""
+    if not MIGRATIONS_DIR.exists():
+        print(f"Migrations directory not found: {MIGRATIONS_DIR}")
+        sys.exit(1)
+
+    migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+    if not migration_files:
+        print(f"No migration files found in: {MIGRATIONS_DIR}")
         sys.exit(1)
 
     try:
-        sql_content = MIGRATION_SQL.read_text()
-        print(f"Read migration file: {MIGRATION_SQL}")
-        print("Run this SQL manually in the Supabase SQL Editor.")
-        print("\nSQL Migration Content:")
-        print("-" * 80)
-        print(sql_content)
-        print("-" * 80)
+        print(f"Read migrations directory: {MIGRATIONS_DIR}")
+        print("Run these SQL files manually in Supabase SQL Editor order.")
+        for migration_file in migration_files:
+            print("\n" + "=" * 80)
+            print(migration_file.name)
+            print("=" * 80)
+            print(migration_file.read_text())
     except Exception as exc:
         print(f"Error: {exc}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    show_database_migration()
+    show_database_migrations()

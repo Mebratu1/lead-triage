@@ -50,7 +50,10 @@ async def database_health_check(
     try:
         query = await _resolve(db.table("leads"))
         query = await _resolve(
-            query.select("id,idempotency_key,source,raw_message,classification_status")
+            query.select(
+                "id,idempotency_key,deduplication_bucket,source,"
+                "raw_message,classification_status,created_at"
+            )
         )
         query = await _resolve(query.limit(1))
         await _resolve(query.execute())
