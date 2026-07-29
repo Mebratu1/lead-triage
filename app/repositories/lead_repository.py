@@ -1,7 +1,7 @@
 """Supabase repository for persisted leads."""
 
 import inspect
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from supabase import AsyncClient
@@ -12,7 +12,20 @@ LEAD_SELECT_FIELDS = "id,source,classification_status,created_at"
 LEAD_CLASSIFICATION_SELECT_FIELDS = (
     "id,source,classification_status,created_at,"
     "customer_name,email,phone,requested_service,urgency,lead_score,ai_summary,"
-    "classification_error,classified_at,classification_model"
+    "classification_error,classified_at,classification_model,"
+    "classification_claimed_at,classification_claimed_by,"
+    "classification_attempt_count,last_classification_error,"
+    "next_classification_attempt_at"
+)
+LEAD_RETRY_SELECT_FIELDS = (
+    "id,classification_status,classification_claimed_at,classification_claimed_by,"
+    "classification_attempt_count,last_classification_error,"
+    "next_classification_attempt_at"
+)
+CLAIMED_LEAD_SELECT_FIELDS = (
+    "id,raw_message,source,classification_status,created_at,"
+    "classification_claimed_at,classification_claimed_by,"
+    "classification_attempt_count"
 )
 PENDING_LEAD_SELECT_FIELDS = "id,raw_message,source,classification_status,created_at"
 SAFE_FAILURE_REASONS = {
@@ -22,6 +35,10 @@ SAFE_FAILURE_REASONS = {
     "classification_client_error",
     "empty_classification_response",
     "invalid_raw_message",
+}
+SAFE_RETRY_REASONS = {
+    "classification_client_error",
+    "classification_update_failed",
 }
 
 
@@ -99,11 +116,28 @@ def _safe_failure_reason(reason: str | None) -> str:
     return "classification_failed"
 
 
+def _safe_retry_reason(reason: str | None) -> str:
+    if reason in SAFE_RETRY_REASONS:
+        return reason
+    return "classification_retry_failed"
+
+
 def _terminal_timestamp_value(classified_at: datetime | None) -> str:
     terminal_timestamp = classified_at or datetime.now(UTC)
     if terminal_timestamp.tzinfo is None:
         terminal_timestamp = terminal_timestamp.replace(tzinfo=UTC)
     return terminal_timestamp.astimezone(UTC).isoformat()
+
+
+def _retry_timestamp_value(now: datetime | None, retry_after_seconds: int) -> str:
+    if retry_after_seconds < 0:
+        raise LeadRepositoryUpdateError("retry_after_seconds must not be negative")
+
+    retry_base = now or datetime.now(UTC)
+    if retry_base.tzinfo is None:
+        retry_base = retry_base.replace(tzinfo=UTC)
+    retry_at = retry_base.astimezone(UTC) + timedelta(seconds=retry_after_seconds)
+    return retry_at.isoformat()
 
 
 def _classification_update_payload(
@@ -125,6 +159,12 @@ def _classification_update_payload(
             "classification_error": _safe_failure_reason(classification.error_reason),
             "classified_at": terminal_timestamp_value,
             "classification_model": classification_model,
+            "classification_claimed_at": None,
+            "classification_claimed_by": None,
+            "last_classification_error": _safe_failure_reason(
+                classification.error_reason
+            ),
+            "next_classification_attempt_at": None,
             "classification_status": LeadClassificationStatus.FAILED.value,
         }
 
@@ -141,6 +181,10 @@ def _classification_update_payload(
             "classification_error": None,
             "classified_at": terminal_timestamp_value,
             "classification_model": classification_model,
+            "classification_claimed_at": None,
+            "classification_claimed_by": None,
+            "last_classification_error": None,
+            "next_classification_attempt_at": None,
             "classification_status": LeadClassificationStatus.CLASSIFIED.value,
         }
 
@@ -197,6 +241,46 @@ async def fetch_pending_leads(
     return rows
 
 
+async def claim_pending_leads(
+    db: AsyncClient,
+    limit: int,
+    worker_id: str,
+    claim_timeout_seconds: int,
+    max_attempts: int,
+) -> list[dict[str, Any]]:
+    """Atomically claim pending leads for one classification worker."""
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    if not worker_id.strip():
+        raise ValueError("worker_id is required")
+    if claim_timeout_seconds < 1:
+        raise ValueError("claim_timeout_seconds must be at least 1")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    try:
+        query = await _resolve(
+            db.rpc(
+                "claim_pending_leads_for_classification",
+                {
+                    "p_batch_limit": limit,
+                    "p_worker_id": worker_id,
+                    "p_claim_timeout_seconds": claim_timeout_seconds,
+                    "p_max_attempts": max_attempts,
+                },
+            )
+        )
+        query = await _resolve(query.select(CLAIMED_LEAD_SELECT_FIELDS))
+        response = await _resolve(query.execute())
+        rows = _rows(response)
+    except LeadRepositoryUnexpectedResult as exc:
+        raise LeadRepositoryLookupError from exc
+    except Exception as exc:
+        raise LeadRepositoryLookupError from exc
+
+    return rows
+
+
 async def insert_lead(
     db: AsyncClient,
     payload: dict[str, Any],
@@ -225,6 +309,7 @@ async def update_lead_classification(
     classification: LeadClassified,
     classification_model: str | None = None,
     classified_at: datetime | None = None,
+    claim_owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomically update a pending lead with classification results."""
     payload = _classification_update_payload(
@@ -243,7 +328,53 @@ async def update_lead_classification(
                 LeadClassificationStatus.PENDING.value,
             )
         )
+        if claim_owner_id is not None:
+            query = await _resolve(query.eq("classification_claimed_by", claim_owner_id))
         query = await _resolve(query.select(LEAD_CLASSIFICATION_SELECT_FIELDS))
+        response = await _resolve(query.execute())
+    except LeadRepositoryUpdateError:
+        raise
+    except Exception as exc:
+        raise LeadRepositoryUpdateError from exc
+
+    row = _first_row(response)
+    if row is None:
+        raise LeadRepositoryUpdateConflict
+
+    return row
+
+
+async def release_lead_classification_claim(
+    db: AsyncClient,
+    lead_id: str,
+    worker_id: str,
+    error_reason: str,
+    retry_after_seconds: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Release a claimed pending lead for a future retry."""
+    payload = {
+        "classification_claimed_at": None,
+        "classification_claimed_by": None,
+        "last_classification_error": _safe_retry_reason(error_reason),
+        "next_classification_attempt_at": _retry_timestamp_value(
+            now=now,
+            retry_after_seconds=retry_after_seconds,
+        ),
+    }
+
+    try:
+        query = await _resolve(db.table("leads"))
+        query = await _resolve(query.update(payload))
+        query = await _resolve(query.eq("id", lead_id))
+        query = await _resolve(
+            query.eq(
+                "classification_status",
+                LeadClassificationStatus.PENDING.value,
+            )
+        )
+        query = await _resolve(query.eq("classification_claimed_by", worker_id))
+        query = await _resolve(query.select(LEAD_RETRY_SELECT_FIELDS))
         response = await _resolve(query.execute())
     except LeadRepositoryUpdateError:
         raise

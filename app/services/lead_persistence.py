@@ -16,9 +16,11 @@ from app.repositories.lead_repository import (
     LeadRepositoryUpdateError,
     LeadRepositoryUnexpectedResult,
     LeadRepositoryUniqueConflict,
+    claim_pending_leads,
     fetch_pending_leads,
     find_by_idempotency,
     insert_lead,
+    release_lead_classification_claim,
     update_lead_classification,
 )
 
@@ -172,6 +174,7 @@ async def persist_lead_classification(
     classification: LeadClassified,
     classification_model: str | None = None,
     classified_at: datetime | None = None,
+    claim_owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist classification output to a pending lead record."""
     try:
@@ -181,6 +184,7 @@ async def persist_lead_classification(
             classification=classification,
             classification_model=classification_model,
             classified_at=classified_at,
+            claim_owner_id=claim_owner_id,
         )
     except LeadRepositoryUpdateConflict as exc:
         raise LeadClassificationUpdateConflict from exc
@@ -197,3 +201,47 @@ async def get_pending_leads_for_classification(
         return await fetch_pending_leads(db=db, limit=limit)
     except LeadRepositoryLookupError as exc:
         raise LeadLookupFailed from exc
+
+
+async def claim_pending_leads_for_classification(
+    db: AsyncClient,
+    limit: int,
+    worker_id: str,
+    claim_timeout_seconds: int,
+    max_attempts: int,
+) -> list[dict[str, Any]]:
+    """Atomically claim pending leads for classification."""
+    try:
+        return await claim_pending_leads(
+            db=db,
+            limit=limit,
+            worker_id=worker_id,
+            claim_timeout_seconds=claim_timeout_seconds,
+            max_attempts=max_attempts,
+        )
+    except LeadRepositoryLookupError as exc:
+        raise LeadLookupFailed from exc
+
+
+async def release_lead_classification_for_retry(
+    db: AsyncClient,
+    lead_id: str,
+    worker_id: str,
+    error_reason: str,
+    retry_after_seconds: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Release a claimed lead after retryable classification failure."""
+    try:
+        return await release_lead_classification_claim(
+            db=db,
+            lead_id=lead_id,
+            worker_id=worker_id,
+            error_reason=error_reason,
+            retry_after_seconds=retry_after_seconds,
+            now=now,
+        )
+    except LeadRepositoryUpdateConflict as exc:
+        raise LeadClassificationUpdateConflict from exc
+    except LeadRepositoryUpdateError as exc:
+        raise LeadClassificationUpdateFailed from exc

@@ -20,7 +20,10 @@ from app.db.client import SupabaseClient
 from app.models.classification import LeadClassificationBatchResult
 from app.services.lead_classification import LeadClassificationClient
 from app.services.lead_classification_worker import (
+    DEFAULT_CLAIM_TIMEOUT_SECONDS,
     DEFAULT_CLASSIFICATION_BATCH_SIZE,
+    DEFAULT_MAX_CLASSIFICATION_ATTEMPTS,
+    DEFAULT_RETRY_AFTER_SECONDS,
     MAX_CLASSIFICATION_BATCH_SIZE,
     process_pending_leads_batch,
 )
@@ -31,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 FetchPendingLeads = Callable[[AsyncClient, int], Awaitable[list[dict[str, Any]]]]
 ProcessBatch = Callable[
-    [AsyncClient, LeadClassificationClient, int],
+    ...,
     Awaitable[LeadClassificationBatchResult],
 ]
 
@@ -80,6 +83,20 @@ def _limit(value: str) -> int:
     return parsed
 
 
+def _positive_int(name: str) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be an integer") from exc
+
+        if parsed < 1:
+            raise argparse.ArgumentTypeError(f"{name} must be at least 1")
+        return parsed
+
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the manual job argument parser."""
     parser = argparse.ArgumentParser(
@@ -98,6 +115,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Fetch pending leads and report counts without OpenAI calls or updates.",
+    )
+    parser.add_argument(
+        "--worker-id",
+        default=None,
+        help="Optional stable worker id used for claimed lead ownership.",
+    )
+    parser.add_argument(
+        "--claim-timeout-seconds",
+        type=_positive_int("claim-timeout-seconds"),
+        default=DEFAULT_CLAIM_TIMEOUT_SECONDS,
+        help=(
+            "Seconds before another runner may reclaim a stale claim. "
+            f"Default: {DEFAULT_CLAIM_TIMEOUT_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--retry-after-seconds",
+        type=_positive_int("retry-after-seconds"),
+        default=DEFAULT_RETRY_AFTER_SECONDS,
+        help=(
+            "Seconds before retrying a lead after a client/OpenAI failure. "
+            f"Default: {DEFAULT_RETRY_AFTER_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=_positive_int("max-attempts"),
+        default=DEFAULT_MAX_CLASSIFICATION_ATTEMPTS,
+        help=(
+            "Maximum classification claim attempts before a pending lead is skipped. "
+            f"Default: {DEFAULT_MAX_CLASSIFICATION_ATTEMPTS}."
+        ),
     )
     return parser
 
@@ -127,11 +176,19 @@ async def _process_batch(
     db: AsyncClient,
     client: LeadClassificationClient,
     limit: int,
+    worker_id: str | None,
+    claim_timeout_seconds: int,
+    retry_after_seconds: int,
+    max_attempts: int,
 ) -> LeadClassificationBatchResult:
     return await process_pending_leads_batch(
         db=db,
         client=client,
         limit=limit,
+        worker_id=worker_id,
+        claim_timeout_seconds=claim_timeout_seconds,
+        retry_after_seconds=retry_after_seconds,
+        max_attempts=max_attempts,
     )
 
 
@@ -140,6 +197,10 @@ async def run_classification_job(
     dry_run: bool = False,
     db: AsyncClient | None = None,
     client: LeadClassificationClient | None = None,
+    worker_id: str | None = None,
+    claim_timeout_seconds: int = DEFAULT_CLAIM_TIMEOUT_SECONDS,
+    retry_after_seconds: int = DEFAULT_RETRY_AFTER_SECONDS,
+    max_attempts: int = DEFAULT_MAX_CLASSIFICATION_ATTEMPTS,
     db_factory: Callable[[], Awaitable[AsyncClient]] = _get_db,
     db_close: Callable[[], Awaitable[None]] = _close_db,
     fetch_pending: FetchPendingLeads = get_pending_leads_for_classification,
@@ -165,7 +226,15 @@ async def run_classification_job(
             return result
 
         active_client = client or OpenAILeadClassificationClient()
-        batch = await process_batch(active_db, active_client, batch_limit)
+        batch = await process_batch(
+            active_db,
+            active_client,
+            batch_limit,
+            worker_id,
+            claim_timeout_seconds,
+            retry_after_seconds,
+            max_attempts,
+        )
         result = ClassificationJobResult.from_batch(batch)
         logger.info(
             "Lead classification job completed fetched=%s saved=%s "
@@ -192,6 +261,10 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         result = await run_classification_job(
             limit=args.limit,
             dry_run=args.dry_run,
+            worker_id=args.worker_id,
+            claim_timeout_seconds=args.claim_timeout_seconds,
+            retry_after_seconds=args.retry_after_seconds,
+            max_attempts=args.max_attempts,
         )
     except Exception as exc:
         logger.error(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +16,7 @@ from app.models.classification import (
 )
 from app.repositories.lead_repository import (
     LeadRepositoryLookupError,
+    claim_pending_leads,
     fetch_pending_leads,
 )
 from app.services.lead_classification_worker import (
@@ -25,6 +26,7 @@ from app.services.lead_classification_worker import (
 
 COMPLETED_AT = datetime(2026, 7, 27, 16, 45, tzinfo=UTC)
 COMPLETED_AT_ISO = COMPLETED_AT.isoformat()
+NEXT_RETRY_AT_ISO = "2026-07-27T16:50:00+00:00"
 
 
 class FakeWorkerQuery:
@@ -33,6 +35,8 @@ class FakeWorkerQuery:
     def __init__(self, database: FakeWorkerDatabase):
         self.database = database
         self.operation = "select"
+        self.rpc_name: str | None = None
+        self.rpc_params: dict[str, Any] = {}
         self.payload: dict[str, Any] | None = None
         self.filters: dict[str, Any] = {}
         self.limit_value: int | None = None
@@ -61,6 +65,9 @@ class FakeWorkerQuery:
         return self
 
     async def execute(self):
+        if self.operation == "rpc":
+            return self.database.execute_rpc(self.rpc_name, self.rpc_params)
+
         if self.operation == "update":
             if self.payload is None:
                 raise RuntimeError("missing update payload")
@@ -82,21 +89,31 @@ class FakeWorkerDatabase:
         rows: list[dict[str, Any]],
         fail_fetch: bool = False,
         invalid_fetch_response: bool = False,
+        invalid_claim_response: bool = False,
         conflict_update_ids: set[str] | None = None,
         fail_update_ids: set[str] | None = None,
     ):
         self.rows = {row["id"]: dict(row) for row in rows}
         self.fail_fetch = fail_fetch
         self.invalid_fetch_response = invalid_fetch_response
+        self.invalid_claim_response = invalid_claim_response
         self.conflict_update_ids = conflict_update_ids or set()
         self.fail_update_ids = fail_update_ids or set()
         self.select_count = 0
+        self.claim_count = 0
         self.update_count = 0
         self.updated_payloads: dict[str, dict[str, Any]] = {}
 
     def table(self, name: str):
         assert name == "leads"
         return FakeWorkerQuery(self)
+
+    def rpc(self, name: str, params: dict[str, Any]):
+        query = FakeWorkerQuery(self)
+        query.operation = "rpc"
+        query.rpc_name = name
+        query.rpc_params = dict(params)
+        return query
 
     def execute_select(
         self,
@@ -124,6 +141,53 @@ class FakeWorkerDatabase:
         if limit is not None:
             rows = rows[:limit]
         return SimpleNamespace(data=rows)
+
+    def execute_rpc(self, name: str | None, params: dict[str, Any]):
+        assert name == "claim_pending_leads_for_classification"
+        self.claim_count += 1
+        if self.fail_fetch:
+            raise RuntimeError("claim failed")
+        if self.invalid_claim_response:
+            return SimpleNamespace(data="not a list")
+
+        limit = params["p_batch_limit"]
+        worker_id = params["p_worker_id"]
+        max_attempts = params["p_max_attempts"]
+        stale_before = COMPLETED_AT - timedelta(
+            seconds=params["p_claim_timeout_seconds"]
+        )
+        candidates = [
+            row
+            for row in self.rows.values()
+            if row["classification_status"] == "pending"
+            and row["classification_attempt_count"] < max_attempts
+            and self._is_retry_available(row)
+            and self._is_unclaimed_or_stale(row, stale_before)
+        ]
+        candidates.sort(key=lambda row: row["created_at"])
+        claimed = []
+        for row in candidates[:limit]:
+            row["classification_claimed_at"] = COMPLETED_AT_ISO
+            row["classification_claimed_by"] = worker_id
+            row["classification_attempt_count"] += 1
+            claimed.append(dict(row))
+        return SimpleNamespace(data=claimed)
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    def _is_retry_available(self, row: dict[str, Any]) -> bool:
+        next_attempt = row["next_classification_attempt_at"]
+        return next_attempt is None or self._parse_timestamp(next_attempt) <= COMPLETED_AT
+
+    def _is_unclaimed_or_stale(
+        self,
+        row: dict[str, Any],
+        stale_before: datetime,
+    ) -> bool:
+        claimed_at = row["classification_claimed_at"]
+        return claimed_at is None or self._parse_timestamp(claimed_at) < stale_before
 
     def execute_update(self, payload: dict[str, Any], filters: dict[str, Any]):
         self.update_count += 1
@@ -199,6 +263,11 @@ def lead_row(
         "classification_error": None,
         "classified_at": None,
         "classification_model": None,
+        "classification_claimed_at": None,
+        "classification_claimed_by": None,
+        "classification_attempt_count": 0,
+        "last_classification_error": None,
+        "next_classification_attempt_at": None,
     }
 
 
@@ -239,6 +308,108 @@ class TestFetchPendingLeads:
         with pytest.raises(LeadRepositoryLookupError):
             asyncio.run(fetch_pending_leads(db=database, limit=1))
 
+    @pytest.mark.unit
+    def test_claim_pending_leads_claims_oldest_available_rows(self):
+        """Test claim RPC marks oldest eligible rows with worker ownership."""
+        database = FakeWorkerDatabase(
+            rows=[
+                lead_row("lead-3", "2026-07-27T16:03:00+00:00"),
+                lead_row("lead-1", "2026-07-27T16:01:00+00:00"),
+                lead_row("lead-2", "2026-07-27T16:02:00+00:00"),
+            ]
+        )
+
+        rows = asyncio.run(
+            claim_pending_leads(
+                db=database,
+                limit=2,
+                worker_id="worker-1",
+                claim_timeout_seconds=900,
+                max_attempts=5,
+            )
+        )
+
+        assert [row["id"] for row in rows] == ["lead-1", "lead-2"]
+        assert database.rows["lead-1"]["classification_claimed_by"] == "worker-1"
+        assert database.rows["lead-1"]["classification_attempt_count"] == 1
+        assert database.rows["lead-3"]["classification_claimed_by"] is None
+
+    @pytest.mark.unit
+    def test_claim_pending_leads_skips_backoff_claimed_and_exhausted_rows(self):
+        """Test claim RPC only returns retry-eligible unclaimed rows."""
+        database = FakeWorkerDatabase(
+            rows=[
+                lead_row("backoff", "2026-07-27T16:01:00+00:00"),
+                lead_row("claimed", "2026-07-27T16:02:00+00:00"),
+                lead_row("exhausted", "2026-07-27T16:03:00+00:00"),
+                lead_row("ready", "2026-07-27T16:04:00+00:00"),
+            ]
+        )
+        database.rows["backoff"]["next_classification_attempt_at"] = (
+            "2026-07-27T17:00:00+00:00"
+        )
+        database.rows["claimed"]["classification_claimed_at"] = COMPLETED_AT_ISO
+        database.rows["claimed"]["classification_claimed_by"] = "worker-2"
+        database.rows["exhausted"]["classification_attempt_count"] = 5
+
+        rows = asyncio.run(
+            claim_pending_leads(
+                db=database,
+                limit=10,
+                worker_id="worker-1",
+                claim_timeout_seconds=900,
+                max_attempts=5,
+            )
+        )
+
+        assert [row["id"] for row in rows] == ["ready"]
+
+    @pytest.mark.unit
+    def test_claim_pending_leads_reclaims_stale_claims(self):
+        """Test stale claims are eligible for a new worker."""
+        database = FakeWorkerDatabase(
+            rows=[
+                lead_row("fresh", "2026-07-27T16:01:00+00:00"),
+                lead_row("stale", "2026-07-27T16:02:00+00:00"),
+            ]
+        )
+        database.rows["fresh"]["classification_claimed_at"] = COMPLETED_AT_ISO
+        database.rows["fresh"]["classification_claimed_by"] = "worker-2"
+        database.rows["stale"]["classification_claimed_at"] = (
+            "2026-07-27T16:20:00+00:00"
+        )
+        database.rows["stale"]["classification_claimed_by"] = "worker-2"
+
+        rows = asyncio.run(
+            claim_pending_leads(
+                db=database,
+                limit=10,
+                worker_id="worker-1",
+                claim_timeout_seconds=900,
+                max_attempts=5,
+            )
+        )
+
+        assert [row["id"] for row in rows] == ["stale"]
+        assert database.rows["stale"]["classification_claimed_by"] == "worker-1"
+        assert database.rows["fresh"]["classification_claimed_by"] == "worker-2"
+
+    @pytest.mark.unit
+    def test_claim_pending_leads_maps_unexpected_response_shape(self):
+        """Test malformed claim RPC responses fail safely."""
+        database = FakeWorkerDatabase(rows=[], invalid_claim_response=True)
+
+        with pytest.raises(LeadRepositoryLookupError):
+            asyncio.run(
+                claim_pending_leads(
+                    db=database,
+                    limit=1,
+                    worker_id="worker-1",
+                    claim_timeout_seconds=900,
+                    max_attempts=5,
+                )
+            )
+
 
 class TestLeadClassificationWorker:
     """Worker-safe batch orchestration tests."""
@@ -265,6 +436,7 @@ class TestLeadClassificationWorker:
                 client=client,
                 limit=2,
                 classified_at=COMPLETED_AT,
+                worker_id="worker-1",
             )
         )
 
@@ -277,6 +449,8 @@ class TestLeadClassificationWorker:
         assert database.rows["lead-1"]["classification_error"] is None
         assert database.rows["lead-1"]["classified_at"] == COMPLETED_AT_ISO
         assert database.rows["lead-1"]["classification_model"] == "gpt-worker-test"
+        assert database.rows["lead-1"]["classification_claimed_by"] is None
+        assert database.rows["lead-1"]["last_classification_error"] is None
         assert database.rows["lead-2"]["lead_score"] == 75
         assert len(client.calls) == 2
 
@@ -295,6 +469,7 @@ class TestLeadClassificationWorker:
                 limit=1,
                 classification_model="explicit-model",
                 classified_at=COMPLETED_AT,
+                worker_id="worker-1",
             )
         )
 
@@ -308,6 +483,8 @@ class TestLeadClassificationWorker:
         assert database.rows["lead-1"]["classification_error"] == "invalid_json"
         assert database.rows["lead-1"]["ai_summary"] is None
         assert database.rows["lead-1"]["classification_model"] == "explicit-model"
+        assert database.rows["lead-1"]["classification_claimed_by"] is None
+        assert database.rows["lead-1"]["last_classification_error"] == "invalid_json"
 
     @pytest.mark.integration
     def test_process_pending_batch_keeps_client_exception_pending(self):
@@ -323,6 +500,7 @@ class TestLeadClassificationWorker:
                 client=client,
                 limit=1,
                 classified_at=COMPLETED_AT,
+                worker_id="worker-1",
             )
         )
 
@@ -336,7 +514,14 @@ class TestLeadClassificationWorker:
         assert result.results[0].error_reason == "classification_client_error"
         assert database.rows["lead-1"]["classification_status"] == "pending"
         assert database.rows["lead-1"]["classification_error"] is None
-        assert database.update_count == 0
+        assert database.rows["lead-1"]["classification_claimed_by"] is None
+        assert database.rows["lead-1"]["last_classification_error"] == (
+            "classification_client_error"
+        )
+        assert database.rows["lead-1"]["next_classification_attempt_at"] == (
+            NEXT_RETRY_AT_ISO
+        )
+        assert database.update_count == 1
 
     @pytest.mark.integration
     def test_process_pending_batch_skips_non_pending_update_conflict(self):
@@ -353,6 +538,7 @@ class TestLeadClassificationWorker:
                 client=client,
                 limit=1,
                 classified_at=COMPLETED_AT,
+                worker_id="worker-1",
             )
         )
 
@@ -362,6 +548,7 @@ class TestLeadClassificationWorker:
             LeadClassificationPersistenceStatus.SKIPPED
         )
         assert database.rows["lead-1"]["classification_status"] == "pending"
+        assert database.rows["lead-1"]["classification_claimed_by"] == "worker-1"
 
     @pytest.mark.integration
     def test_process_pending_batch_continues_after_update_error(self):
@@ -381,6 +568,7 @@ class TestLeadClassificationWorker:
                 client=client,
                 limit=2,
                 classified_at=COMPLETED_AT,
+                worker_id="worker-1",
             )
         )
 
@@ -389,6 +577,7 @@ class TestLeadClassificationWorker:
         assert result.classified == 1
         assert result.errors == 1
         assert database.rows["lead-1"]["classification_status"] == "pending"
+        assert database.rows["lead-1"]["classification_claimed_by"] == "worker-1"
         assert database.rows["lead-2"]["classification_status"] == "classified"
 
     @pytest.mark.integration
@@ -404,6 +593,7 @@ class TestLeadClassificationWorker:
                     client=client,
                     limit=1,
                     classified_at=COMPLETED_AT,
+                    worker_id="worker-1",
                 )
             )
 
@@ -421,4 +611,4 @@ class TestLeadClassificationWorker:
                 process_pending_leads_batch(db=database, client=client, limit=101)
             )
 
-        assert database.select_count == 0
+        assert database.claim_count == 0

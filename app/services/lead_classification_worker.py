@@ -7,6 +7,7 @@ tasks, schedulers, queues, or long-running loops.
 import logging
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from supabase import AsyncClient
 
@@ -25,14 +26,18 @@ from app.services.lead_persistence import (
     LeadClassificationUpdateConflict,
     LeadClassificationUpdateFailed,
     LeadLookupFailed,
-    get_pending_leads_for_classification,
+    claim_pending_leads_for_classification,
     persist_lead_classification,
+    release_lead_classification_for_retry,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLASSIFICATION_BATCH_SIZE = 10
 MAX_CLASSIFICATION_BATCH_SIZE = 100
+DEFAULT_CLAIM_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_RETRY_AFTER_SECONDS = 5 * 60
+DEFAULT_MAX_CLASSIFICATION_ATTEMPTS = 5
 
 
 class LeadClassificationBatchFetchFailed(Exception):
@@ -58,6 +63,12 @@ def _classification_model_name(
 
     model = getattr(client, "model", None)
     return model if isinstance(model, str) and model else None
+
+
+def _worker_id(worker_id: str | None) -> str:
+    if worker_id and worker_id.strip():
+        return worker_id.strip()
+    return f"lead-classifier-{uuid4()}"
 
 
 def _result(
@@ -123,9 +134,14 @@ async def process_pending_leads_batch(
     limit: int = DEFAULT_CLASSIFICATION_BATCH_SIZE,
     classification_model: str | None = None,
     classified_at: datetime | None = None,
+    worker_id: str | None = None,
+    claim_timeout_seconds: int = DEFAULT_CLAIM_TIMEOUT_SECONDS,
+    retry_after_seconds: int = DEFAULT_RETRY_AFTER_SECONDS,
+    max_attempts: int = DEFAULT_MAX_CLASSIFICATION_ATTEMPTS,
 ) -> LeadClassificationBatchResult:
     """Classify and persist one bounded batch of pending leads."""
     batch_limit = _validate_batch_limit(limit)
+    active_worker_id = _worker_id(worker_id)
     model_name = _classification_model_name(
         client=client,
         classification_model=classification_model,
@@ -133,15 +149,18 @@ async def process_pending_leads_batch(
     completed_at = classified_at or datetime.now(UTC)
 
     try:
-        pending_leads = await get_pending_leads_for_classification(
+        claimed_leads = await claim_pending_leads_for_classification(
             db=db,
             limit=batch_limit,
+            worker_id=active_worker_id,
+            claim_timeout_seconds=claim_timeout_seconds,
+            max_attempts=max_attempts,
         )
     except LeadLookupFailed as exc:
         raise LeadClassificationBatchFetchFailed from exc
 
     results: list[LeadClassificationWorkItemResult] = []
-    for lead in pending_leads:
+    for lead in claimed_leads:
         lead_id = str(lead["id"])
         try:
             classification = await _classify_lead(lead=lead, client=client)
@@ -150,6 +169,29 @@ async def process_pending_leads_batch(
                 "Lead classification client failed",
                 extra={"lead_id": lead_id},
             )
+            try:
+                await release_lead_classification_for_retry(
+                    db=db,
+                    lead_id=lead_id,
+                    worker_id=active_worker_id,
+                    error_reason="classification_client_error",
+                    retry_after_seconds=retry_after_seconds,
+                    now=completed_at,
+                )
+            except (LeadClassificationUpdateConflict, LeadClassificationUpdateFailed):
+                logger.warning(
+                    "Lead classification retry release failed",
+                    extra={"lead_id": lead_id},
+                )
+                results.append(
+                    _result(
+                        lead_id=lead_id,
+                        persistence_status=LeadClassificationPersistenceStatus.ERROR,
+                        error_reason="classification_retry_release_failed",
+                    )
+                )
+                continue
+
             results.append(
                 _result(
                     lead_id=lead_id,
@@ -166,6 +208,7 @@ async def process_pending_leads_batch(
                 classification=classification,
                 classification_model=model_name,
                 classified_at=completed_at,
+                claim_owner_id=active_worker_id,
             )
         except LeadClassificationUpdateConflict:
             results.append(
@@ -200,4 +243,4 @@ async def process_pending_leads_batch(
             )
         )
 
-    return _summarize(fetched=len(pending_leads), results=results)
+    return _summarize(fetched=len(claimed_leads), results=results)

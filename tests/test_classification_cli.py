@@ -40,10 +40,28 @@ class TestClassifyPendingLeadsCliArgs:
     @pytest.mark.unit
     def test_parse_args_accepts_limit_and_dry_run(self):
         """Test explicit limit and dry-run options."""
-        args = parse_args(["--limit", "25", "--dry-run"])
+        args = parse_args(
+            [
+                "--limit",
+                "25",
+                "--dry-run",
+                "--worker-id",
+                "worker-1",
+                "--claim-timeout-seconds",
+                "30",
+                "--retry-after-seconds",
+                "45",
+                "--max-attempts",
+                "3",
+            ]
+        )
 
         assert args.limit == 25
         assert args.dry_run is True
+        assert args.worker_id == "worker-1"
+        assert args.claim_timeout_seconds == 30
+        assert args.retry_after_seconds == 45
+        assert args.max_attempts == 3
 
     @pytest.mark.unit
     @pytest.mark.parametrize("limit", ["0", "-1", "101", "not-a-number"])
@@ -51,6 +69,24 @@ class TestClassifyPendingLeadsCliArgs:
         """Test invalid limits fail argument parsing."""
         with pytest.raises(SystemExit):
             parse_args(["--limit", limit])
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("--claim-timeout-seconds", "0"),
+            ("--retry-after-seconds", "-1"),
+            ("--max-attempts", "not-a-number"),
+        ],
+    )
+    def test_parse_args_rejects_invalid_claim_retry_options(
+        self,
+        option: str,
+        value: str,
+    ):
+        """Test claim and retry options must be positive integers."""
+        with pytest.raises(SystemExit):
+            parse_args([option, value])
 
 
 class TestClassifyPendingLeadsCliExecution:
@@ -80,7 +116,15 @@ class TestClassifyPendingLeadsCliExecution:
                 }
             ]
 
-        async def process_batch(db, client, limit):
+        async def process_batch(
+            db,
+            client,
+            limit,
+            worker_id,
+            claim_timeout_seconds,
+            retry_after_seconds,
+            max_attempts,
+        ):
             raise AssertionError("dry-run must not process the batch")
 
         with caplog.at_level(logging.INFO):
@@ -117,11 +161,23 @@ class TestClassifyPendingLeadsCliExecution:
         async def fetch_pending(db, limit):
             raise AssertionError("normal run should use process_batch")
 
-        async def process_batch(db, active_client, limit):
+        async def process_batch(
+            db,
+            active_client,
+            limit,
+            worker_id,
+            claim_timeout_seconds,
+            retry_after_seconds,
+            max_attempts,
+        ):
             calls["process"] = {
                 "db": db,
                 "client": active_client,
                 "limit": limit,
+                "worker_id": worker_id,
+                "claim_timeout_seconds": claim_timeout_seconds,
+                "retry_after_seconds": retry_after_seconds,
+                "max_attempts": max_attempts,
             }
             return LeadClassificationBatchResult(
                 fetched=3,
@@ -138,6 +194,10 @@ class TestClassifyPendingLeadsCliExecution:
                 limit=3,
                 dry_run=False,
                 client=client,
+                worker_id="worker-1",
+                claim_timeout_seconds=30,
+                retry_after_seconds=45,
+                max_attempts=3,
                 db_factory=db_factory,
                 db_close=db_close,
                 fetch_pending=fetch_pending,
@@ -158,6 +218,10 @@ class TestClassifyPendingLeadsCliExecution:
             "db": database,
             "client": client,
             "limit": 3,
+            "worker_id": "worker-1",
+            "claim_timeout_seconds": 30,
+            "retry_after_seconds": 45,
+            "max_attempts": 3,
         }
         assert calls["closed"] is True
 
@@ -189,9 +253,20 @@ class TestClassifyPendingLeadsCliExecution:
     @pytest.mark.unit
     def test_async_main_returns_nonzero_on_batch_errors(self, monkeypatch):
         """Test CLI exits non-zero when the batch reports persistence errors."""
-        async def fake_run_classification_job(limit: int, dry_run: bool):
+        async def fake_run_classification_job(
+            limit: int,
+            dry_run: bool,
+            worker_id: str | None,
+            claim_timeout_seconds: int,
+            retry_after_seconds: int,
+            max_attempts: int,
+        ):
             assert limit == 2
             assert dry_run is False
+            assert worker_id == "worker-1"
+            assert claim_timeout_seconds == 30
+            assert retry_after_seconds == 45
+            assert max_attempts == 3
             return ClassificationJobResult(
                 dry_run=False,
                 fetched=2,
@@ -204,7 +279,22 @@ class TestClassifyPendingLeadsCliExecution:
             fake_run_classification_job,
         )
 
-        exit_code = asyncio.run(async_main(["--limit", "2"]))
+        exit_code = asyncio.run(
+            async_main(
+                [
+                    "--limit",
+                    "2",
+                    "--worker-id",
+                    "worker-1",
+                    "--claim-timeout-seconds",
+                    "30",
+                    "--retry-after-seconds",
+                    "45",
+                    "--max-attempts",
+                    "3",
+                ]
+            )
+        )
 
         assert exit_code == 1
 
@@ -213,7 +303,14 @@ class TestClassifyPendingLeadsCliExecution:
         """Test CLI failure logs only the exception type."""
         raw_message = "Private customer text 301-555-0144"
 
-        async def fake_run_classification_job(limit: int, dry_run: bool):
+        async def fake_run_classification_job(
+            limit: int,
+            dry_run: bool,
+            worker_id: str | None,
+            claim_timeout_seconds: int,
+            retry_after_seconds: int,
+            max_attempts: int,
+        ):
             raise RuntimeError(raw_message)
 
         monkeypatch.setattr(

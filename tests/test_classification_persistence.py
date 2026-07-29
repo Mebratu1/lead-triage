@@ -13,11 +13,13 @@ from app.models.classification import LeadClassified, LeadUrgency
 from app.repositories.lead_repository import (
     LeadRepositoryUpdateConflict,
     LeadRepositoryUpdateError,
+    release_lead_classification_claim,
     update_lead_classification,
 )
 from app.services.lead_persistence import (
     LeadClassificationUpdateConflict,
     persist_lead_classification,
+    release_lead_classification_for_retry,
 )
 
 COMPLETED_AT = datetime(2026, 7, 27, 15, 30, tzinfo=UTC)
@@ -102,6 +104,11 @@ def pending_lead(**overrides) -> dict[str, Any]:
         "classification_error": None,
         "classified_at": None,
         "classification_model": None,
+        "classification_claimed_at": None,
+        "classification_claimed_by": None,
+        "classification_attempt_count": 0,
+        "last_classification_error": None,
+        "next_classification_attempt_at": None,
     }
     row.update(overrides)
     return row
@@ -166,6 +173,10 @@ class TestLeadClassificationRepository:
                 "classification_error": None,
                 "classified_at": COMPLETED_AT_ISO,
                 "classification_model": "gpt-test",
+                "classification_claimed_at": None,
+                "classification_claimed_by": None,
+                "last_classification_error": None,
+                "next_classification_attempt_at": None,
                 "classification_status": "classified",
             }
         ]
@@ -197,6 +208,10 @@ class TestLeadClassificationRepository:
         assert updated["classification_error"] == "invalid_json"
         assert updated["classified_at"] == COMPLETED_AT_ISO
         assert updated["classification_model"] == "gpt-test"
+        assert updated["classification_claimed_at"] is None
+        assert updated["classification_claimed_by"] is None
+        assert updated["last_classification_error"] == "invalid_json"
+        assert updated["next_classification_attempt_at"] is None
 
     @pytest.mark.unit
     def test_failed_classification_does_not_persist_untrusted_error_text(self):
@@ -235,12 +250,79 @@ class TestLeadClassificationRepository:
                     lead_id=database.row["id"],
                     classification=classification,
                     classified_at=COMPLETED_AT,
+                    claim_owner_id="worker-1",
                 )
             )
 
         assert database.row["classification_status"] == "classified"
         assert database.row["lead_score"] is None
         assert database.updated_payloads == []
+
+    @pytest.mark.unit
+    def test_atomic_update_requires_claim_owner_when_supplied(self):
+        """Test claimed rows can only be completed by the owner."""
+        database = FakeClassificationUpdateDatabase(
+            row=pending_lead(classification_claimed_by="worker-2")
+        )
+
+        with pytest.raises(LeadRepositoryUpdateConflict):
+            asyncio.run(
+                update_lead_classification(
+                    db=database,
+                    lead_id=database.row["id"],
+                    classification=classified_result(),
+                    classified_at=COMPLETED_AT,
+                    claim_owner_id="worker-1",
+                )
+            )
+
+        assert database.row["classification_status"] == "pending"
+        assert database.updated_payloads == []
+
+    @pytest.mark.unit
+    def test_release_claim_for_retry_clears_claim_and_sets_backoff(self):
+        """Test retryable failures release ownership with safe retry metadata."""
+        database = FakeClassificationUpdateDatabase(
+            row=pending_lead(classification_claimed_by="worker-1")
+        )
+
+        updated = asyncio.run(
+            release_lead_classification_claim(
+                db=database,
+                lead_id=database.row["id"],
+                worker_id="worker-1",
+                error_reason="classification_client_error",
+                retry_after_seconds=60,
+                now=COMPLETED_AT,
+            )
+        )
+
+        assert updated["classification_status"] == "pending"
+        assert updated["classification_claimed_at"] is None
+        assert updated["classification_claimed_by"] is None
+        assert updated["last_classification_error"] == "classification_client_error"
+        assert updated["next_classification_attempt_at"] == (
+            "2026-07-27T15:31:00+00:00"
+        )
+
+    @pytest.mark.unit
+    def test_release_claim_for_retry_requires_claim_owner(self):
+        """Test a different worker cannot release another worker's claim."""
+        database = FakeClassificationUpdateDatabase(
+            row=pending_lead(classification_claimed_by="worker-2")
+        )
+
+        with pytest.raises(LeadRepositoryUpdateConflict):
+            asyncio.run(
+                release_lead_classification_claim(
+                    db=database,
+                    lead_id=database.row["id"],
+                    worker_id="worker-1",
+                    error_reason="classification_client_error",
+                    retry_after_seconds=60,
+                    now=COMPLETED_AT,
+                )
+            )
 
     @pytest.mark.unit
     def test_database_update_failure_raises_controlled_error(self):
@@ -276,6 +358,7 @@ class TestLeadClassificationPersistence:
                 classification=classified_result(lead_score=75),
                 classification_model="gpt-test",
                 classified_at=COMPLETED_AT,
+                claim_owner_id=None,
             )
         )
 
@@ -300,3 +383,24 @@ class TestLeadClassificationPersistence:
                     classified_at=COMPLETED_AT,
                 )
             )
+
+    @pytest.mark.integration
+    def test_persistence_wrapper_releases_claim_for_retry(self):
+        """Test service wrapper maps retry release results."""
+        database = FakeClassificationUpdateDatabase(
+            row=pending_lead(classification_claimed_by="worker-1")
+        )
+
+        updated = asyncio.run(
+            release_lead_classification_for_retry(
+                db=database,
+                lead_id=database.row["id"],
+                worker_id="worker-1",
+                error_reason="untrusted test-service-role-key details",
+                retry_after_seconds=30,
+                now=COMPLETED_AT,
+            )
+        )
+
+        assert updated["last_classification_error"] == "classification_retry_failed"
+        assert "test-service-role-key" not in repr(updated)
