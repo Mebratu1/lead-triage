@@ -2,19 +2,24 @@
 
 import hashlib
 from datetime import UTC, date, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from supabase import AsyncClient
 
 from app.config import settings
+from app.models.classification import LeadClassified
 from app.models.lead import LeadCreateRequest, LeadPersistedResponse
 from app.repositories.lead_repository import (
     LeadRepositoryInsertError,
     LeadRepositoryLookupError,
+    LeadRepositoryUpdateConflict,
+    LeadRepositoryUpdateError,
     LeadRepositoryUnexpectedResult,
     LeadRepositoryUniqueConflict,
+    fetch_pending_leads,
     find_by_idempotency,
     insert_lead,
+    update_lead_classification,
 )
 
 CLASSIFICATION_PENDING: Literal["pending"] = "pending"
@@ -35,6 +40,14 @@ class LeadInsertFailed(LeadPersistenceError):
 
 class LeadUnexpectedPersistenceFailure(LeadPersistenceError):
     """Raised when persistence returns an unexpected result."""
+
+
+class LeadClassificationUpdateFailed(LeadPersistenceError):
+    """Raised when saving classification output fails."""
+
+
+class LeadClassificationUpdateConflict(LeadClassificationUpdateFailed):
+    """Raised when the lead is missing or no longer pending."""
 
 
 def normalize_source(source: str) -> str:
@@ -151,3 +164,36 @@ async def persist_lead(
         raise LeadUnexpectedPersistenceFailure from exc
 
     return _to_response(inserted_lead, duplicate=False)
+
+
+async def persist_lead_classification(
+    db: AsyncClient,
+    lead_id: str,
+    classification: LeadClassified,
+    classification_model: str | None = None,
+    classified_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist classification output to a pending lead record."""
+    try:
+        return await update_lead_classification(
+            db=db,
+            lead_id=lead_id,
+            classification=classification,
+            classification_model=classification_model,
+            classified_at=classified_at,
+        )
+    except LeadRepositoryUpdateConflict as exc:
+        raise LeadClassificationUpdateConflict from exc
+    except LeadRepositoryUpdateError as exc:
+        raise LeadClassificationUpdateFailed from exc
+
+
+async def get_pending_leads_for_classification(
+    db: AsyncClient,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Fetch pending leads for classification orchestration."""
+    try:
+        return await fetch_pending_leads(db=db, limit=limit)
+    except LeadRepositoryLookupError as exc:
+        raise LeadLookupFailed from exc
