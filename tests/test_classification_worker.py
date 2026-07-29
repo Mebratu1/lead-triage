@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -487,22 +488,30 @@ class TestLeadClassificationWorker:
         assert database.rows["lead-1"]["last_classification_error"] == "invalid_json"
 
     @pytest.mark.integration
-    def test_process_pending_batch_keeps_client_exception_pending(self):
+    def test_process_pending_batch_keeps_client_exception_pending(self, caplog):
         """Test OpenAI/client failures do not burn pending leads."""
+        raw_message = "Private customer text 301-555-0144"
         database = FakeWorkerDatabase(
-            rows=[lead_row("lead-1", "2026-07-27T16:01:00+00:00")]
+            rows=[
+                lead_row(
+                    "lead-1",
+                    "2026-07-27T16:01:00+00:00",
+                    raw_message=raw_message,
+                )
+            ]
         )
         client = FakeWorkerClassificationClient([RuntimeError("network outage")])
 
-        result = asyncio.run(
-            process_pending_leads_batch(
-                db=database,
-                client=client,
-                limit=1,
-                classified_at=COMPLETED_AT,
-                worker_id="worker-1",
+        with caplog.at_level(logging.INFO):
+            result = asyncio.run(
+                process_pending_leads_batch(
+                    db=database,
+                    client=client,
+                    limit=1,
+                    classified_at=COMPLETED_AT,
+                    worker_id="worker-1",
+                )
             )
-        )
 
         assert result.saved == 0
         assert result.failed == 0
@@ -522,6 +531,9 @@ class TestLeadClassificationWorker:
             NEXT_RETRY_AT_ISO
         )
         assert database.update_count == 1
+        assert "retry_after_seconds=300" in caplog.text
+        assert raw_message not in caplog.text
+        assert "301-555-0144" not in caplog.text
 
     @pytest.mark.integration
     def test_process_pending_batch_skips_non_pending_update_conflict(self):

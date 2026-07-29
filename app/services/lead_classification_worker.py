@@ -178,6 +178,11 @@ async def process_pending_leads_batch(
                     retry_after_seconds=retry_after_seconds,
                     now=completed_at,
                 )
+                logger.info(
+                    "Lead classification retry scheduled retry_after_seconds=%s",
+                    retry_after_seconds,
+                    extra={"lead_id": lead_id},
+                )
             except (LeadClassificationUpdateConflict, LeadClassificationUpdateFailed):
                 logger.warning(
                     "Lead classification retry release failed",
