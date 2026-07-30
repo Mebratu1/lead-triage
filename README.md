@@ -159,7 +159,7 @@ Invoke-RestMethod `
 
 Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, sync status, sync timestamp, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, raw integration errors, or retry error details.
 
-`GET /api/leads/export/csv` accepts the same filters as the lead list endpoint plus bounded `limit` and `offset` controls. The CSV includes only `ID`, `Source`, `Customer Name`, `Customer Email`, `Customer Phone`, `Status`, `Urgency`, `Summary`, and `Created At`.
+`GET /api/leads/export/csv` accepts the same filters as the lead list endpoint plus bounded `limit` and `offset` controls. It streams `classified_leads_export.csv` with only `ID`, `Source`, `Customer Name`, `Customer Email`, `Customer Phone`, `Status`, `Urgency`, `Summary`, and `Created At`. Exported cells are escaped when they look like spreadsheet formulas.
 
 `POST /api/leads/{id}/sync` records outbound CRM sync tracking for classified leads only. The current dispatcher is a safe adapter boundary with no vendor-specific network call yet; failures are stored as sanitized integration reasons with a retry timestamp, not raw exception text.
 

@@ -295,8 +295,11 @@ class TestLeadCsvExport:
         response = get_with_db(client, database, "/api/leads/export/csv")
 
         assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/csv")
-        assert response.headers["content-disposition"] == 'attachment; filename="leads.csv"'
+        assert response.headers["content-type"] == "text/csv; charset=utf-8"
+        assert (
+            response.headers["content-disposition"]
+            == 'attachment; filename="classified_leads_export.csv"'
+        )
 
         reader = csv.DictReader(StringIO(response.text))
         rows = list(reader)
@@ -316,6 +319,21 @@ class TestLeadCsvExport:
         assert "deduplication_bucket" not in response.text
         assert "integration_error" not in response.text
         assert "test-service-role-key" not in response.text
+
+    @pytest.mark.unit
+    def test_csv_export_escapes_spreadsheet_formula_cells(self, client: TestClient):
+        """Test CSV export neutralizes spreadsheet formula injection values."""
+        rows = read_rows()
+        rows[0]["customer_name"] = "=cmd|' /C calc'!A0"
+        rows[0]["ai_summary"] = " +SUM(1,1)"
+        database = FakeCrmExportDatabase(rows=rows)
+
+        response = get_with_db(client, database, "/api/leads/export/csv")
+
+        assert response.status_code == 200
+        exported_rows = csv_rows(response.text)
+        assert exported_rows[0]["Customer Name"] == "'=cmd|' /C calc'!A0"
+        assert exported_rows[0]["Summary"] == "' +SUM(1,1)"
 
     @pytest.mark.unit
     def test_csv_export_applies_status_urgency_source_and_date_filters(

@@ -5,10 +5,11 @@ from datetime import UTC, datetime
 from io import StringIO
 import logging
 from secrets import compare_digest
-from typing import Annotated
+from typing import Annotated, Iterator
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from supabase import AsyncClient
 
 from app.config import settings
@@ -62,6 +63,7 @@ CSV_EXPORT_HEADERS = [
     "Created At",
 ]
 CRM_SYNC_RETRY_AFTER_SECONDS = 300
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
 def require_admin_access(x_admin_token: AdminToken = None) -> None:
@@ -166,29 +168,51 @@ def _csv_datetime(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _leads_to_csv(rows: list[dict]) -> str:
-    """Serialize public lead rows to a safe CSV export."""
+def _safe_csv_cell(value: object) -> str:
+    """Render one safe CSV cell for spreadsheet-oriented exports."""
+    if value is None:
+        return ""
+
+    text = str(value)
+    stripped = text.lstrip()
+    if stripped.startswith(CSV_FORMULA_PREFIXES):
+        return f"'{text}"
+    return text
+
+
+def _lead_to_csv_record(row: dict) -> dict[str, str]:
+    """Map one public lead row to safe CSV columns."""
+    lead = _public_lead_from_row(row)
+    return {
+        "ID": _safe_csv_cell(lead.id),
+        "Source": _safe_csv_cell(lead.source),
+        "Customer Name": _safe_csv_cell(lead.customer_name),
+        "Customer Email": _safe_csv_cell(lead.customer_email),
+        "Customer Phone": _safe_csv_cell(lead.customer_phone),
+        "Status": _safe_csv_cell(lead.classification_status),
+        "Urgency": _safe_csv_cell(lead.urgency),
+        "Summary": _safe_csv_cell(lead.summary),
+        "Created At": _safe_csv_cell(_csv_datetime(lead.created_at)),
+    }
+
+
+def _csv_line(record: dict[str, str]) -> str:
+    """Serialize one CSV record to a single response chunk."""
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=CSV_EXPORT_HEADERS)
+    writer.writerow(record)
+    return output.getvalue()
+
+
+def _lead_csv_stream(rows: list[dict]) -> Iterator[str]:
+    """Stream safe CSV export rows without exposing internal fields."""
     output = StringIO()
     writer = csv.DictWriter(output, fieldnames=CSV_EXPORT_HEADERS)
     writer.writeheader()
+    yield output.getvalue()
 
     for row in rows:
-        lead = _public_lead_from_row(row)
-        writer.writerow(
-            {
-                "ID": str(lead.id),
-                "Source": lead.source,
-                "Customer Name": lead.customer_name or "",
-                "Customer Email": lead.customer_email or "",
-                "Customer Phone": lead.customer_phone or "",
-                "Status": lead.classification_status,
-                "Urgency": lead.urgency or "",
-                "Summary": lead.summary or "",
-                "Created At": _csv_datetime(lead.created_at),
-            }
-        )
-
-    return output.getvalue()
+        yield _csv_line(_lead_to_csv_record(row))
 
 
 @router.get(
@@ -261,7 +285,7 @@ async def export_leads_csv(
     offset: LeadOffset = 0,
     _: None = Depends(require_admin_access),
     db: AsyncClient = Depends(get_db),
-) -> Response:
+) -> StreamingResponse:
     """Return a filtered CSV export with only admin-safe lead fields."""
     _validate_date_range(start_date=start_date, end_date=end_date)
     effective_classification_status = _classification_status_filter(
@@ -292,10 +316,14 @@ async def export_leads_csv(
             detail="Lead export failed",
         ) from exc
 
-    return Response(
-        content=_leads_to_csv(rows),
+    return StreamingResponse(
+        _lead_csv_stream(rows),
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="leads.csv"'},
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="classified_leads_export.csv"'
+            )
+        },
     )
 
 
