@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db.client import SupabaseClient
 from app.api.routes import leads
-from app.routes import health
+from app.routes import admin, health
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -48,6 +48,7 @@ def create_app() -> FastAPI:
     )
 
     # Register routes
+    app.include_router(admin.router)
     app.include_router(health.router)
     app.include_router(leads.router, prefix="/api")
 

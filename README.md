@@ -16,6 +16,7 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Autonomous classification daemon connected
 - Queue health metrics connected
 - Admin lead read API foundation connected
+- Browser admin dashboard shell connected
 - CRM integrations not yet connected
 
 ## Runtime
@@ -148,6 +149,19 @@ Invoke-RestMethod `
 ```
 
 Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, or retry error details.
+
+### Browser Admin Dashboard
+
+```http
+GET /admin
+```
+
+The dashboard is a lightweight browser shell served by the FastAPI app. It does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to load queue metrics and protected lead data from the existing JSON endpoints.
+
+The page uses:
+
+- `Authorization: Bearer <QUEUE_METRICS_TOKEN>` for `GET /health/queue`
+- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads`
 
 ## Idempotency
 
@@ -550,7 +564,7 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Admin dashboard UI for classified lead review
+1. Admin dashboard interaction hardening and richer lead detail views
 2. CRM integration from classified lead records
 3. Alert routing for queue metrics and repeated worker failures
 4. Deployment automation with provider-specific infrastructure files
