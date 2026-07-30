@@ -8,6 +8,7 @@ from supabase import AsyncClient
 
 from app.config import settings
 from app.models.classification import LeadClassified
+from app.models.classification import LeadClassificationQueueMetrics
 from app.models.lead import LeadCreateRequest, LeadPersistedResponse
 from app.repositories.lead_repository import (
     LeadRepositoryInsertError,
@@ -17,6 +18,7 @@ from app.repositories.lead_repository import (
     LeadRepositoryUnexpectedResult,
     LeadRepositoryUniqueConflict,
     claim_pending_leads,
+    fetch_classification_queue_metrics,
     fetch_pending_leads,
     find_by_idempotency,
     insert_lead,
@@ -199,6 +201,22 @@ async def get_pending_leads_for_classification(
     """Fetch pending leads for classification orchestration."""
     try:
         return await fetch_pending_leads(db=db, limit=limit)
+    except LeadRepositoryLookupError as exc:
+        raise LeadLookupFailed from exc
+
+
+async def get_classification_queue_metrics(
+    db: AsyncClient,
+    max_attempts: int,
+    now: datetime | None = None,
+) -> LeadClassificationQueueMetrics:
+    """Fetch aggregate classification queue health counters."""
+    try:
+        return await fetch_classification_queue_metrics(
+            db=db,
+            max_attempts=max_attempts,
+            now=now,
+        )
     except LeadRepositoryLookupError as exc:
         raise LeadLookupFailed from exc
 

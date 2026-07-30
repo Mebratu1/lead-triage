@@ -17,3 +17,13 @@ class DatabaseHealthResponse(BaseModel):
 
     status: str
     database: str
+
+
+class QueueHealthResponse(BaseModel):
+    """Classification queue health response."""
+
+    status: str
+    pending_count: int
+    backoff_count: int
+    exhausted_count: int
+    max_attempts: int

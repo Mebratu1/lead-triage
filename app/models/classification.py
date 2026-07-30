@@ -162,3 +162,14 @@ class LeadClassificationBatchResult(BaseModel):
     skipped: int
     errors: int
     results: list[LeadClassificationWorkItemResult]
+
+
+class LeadClassificationQueueMetrics(BaseModel):
+    """Aggregate queue health counters for classification monitoring."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pending_count: int = Field(ge=0)
+    backoff_count: int = Field(ge=0)
+    exhausted_count: int = Field(ge=0)
+    max_attempts: int = Field(ge=1)

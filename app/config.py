@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     # API
     allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:8000"]
+    queue_metrics_token: str | None = None
 
     # Deduplication
     dedup_window_days: int = 7
@@ -85,6 +86,17 @@ class Settings(BaseSettings):
             raise ValueError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
         return cleaned
 
+    @field_validator("queue_metrics_token")
+    @classmethod
+    def optional_token_must_not_be_blank(cls, value: str | None) -> str | None:
+        """Treat blank optional monitoring tokens as absent outside production."""
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        return cleaned
+
     @model_validator(mode="after")
     def production_settings_must_be_safe(self) -> "Settings":
         """Fail fast on unsafe production configuration."""
@@ -97,6 +109,12 @@ class Settings(BaseSettings):
         if self.jwt_secret in INSECURE_JWT_SECRETS or len(self.jwt_secret) < 32:
             raise ValueError(
                 "JWT_SECRET must be a generated secret with at least 32 characters "
+                "in production"
+            )
+
+        if self.queue_metrics_token is None or len(self.queue_metrics_token) < 24:
+            raise ValueError(
+                "QUEUE_METRICS_TOKEN must be configured with at least 24 characters "
                 "in production"
             )
 

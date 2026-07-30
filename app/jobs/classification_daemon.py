@@ -18,7 +18,10 @@ from supabase import AsyncClient
 
 from app.config import settings
 from app.db.client import SupabaseClient
-from app.models.classification import LeadClassificationBatchResult
+from app.models.classification import (
+    LeadClassificationBatchResult,
+    LeadClassificationQueueMetrics,
+)
 from app.services.lead_classification import LeadClassificationClient
 from app.services.lead_classification_worker import (
     DEFAULT_CLAIM_TIMEOUT_SECONDS,
@@ -28,6 +31,7 @@ from app.services.lead_classification_worker import (
     MAX_CLASSIFICATION_BATCH_SIZE,
     process_pending_leads_batch,
 )
+from app.services.lead_persistence import get_classification_queue_metrics
 from app.services.openai_client import OpenAILeadClassificationClient
 
 logger = logging.getLogger(__name__)
@@ -39,6 +43,10 @@ ProcessBatch = Callable[
     Awaitable[LeadClassificationBatchResult],
 ]
 Sleep = Callable[[float], Awaitable[None]]
+FetchQueueMetrics = Callable[
+    [AsyncClient, int],
+    Awaitable[LeadClassificationQueueMetrics],
+]
 
 
 @dataclass(frozen=True)
@@ -234,6 +242,16 @@ async def _process_batch(
     )
 
 
+async def _fetch_queue_metrics(
+    db: AsyncClient,
+    max_attempts: int,
+) -> LeadClassificationQueueMetrics:
+    return await get_classification_queue_metrics(
+        db=db,
+        max_attempts=max_attempts,
+    )
+
+
 def _empty_summary() -> DaemonRunSummary:
     return DaemonRunSummary(
         iterations=0,
@@ -270,6 +288,7 @@ async def run_daemon(
     db_close: Callable[[], Awaitable[None]] = _close_db,
     client_factory: Callable[[], Awaitable[LeadClassificationClient]] = _get_client,
     process_batch: ProcessBatch = _process_batch,
+    fetch_queue_metrics: FetchQueueMetrics = _fetch_queue_metrics,
     sleep: Sleep = asyncio.sleep,
 ) -> DaemonRunSummary:
     """Run classification batches until shutdown or run-once completion."""
@@ -313,9 +332,22 @@ async def run_daemon(
                 )
 
             summary = _add_batch(summary, batch)
+            queue_metrics: LeadClassificationQueueMetrics | None = None
+            try:
+                queue_metrics = await fetch_queue_metrics(
+                    active_db,
+                    daemon_settings.max_attempts,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Lead classification queue metrics unavailable error_type=%s",
+                    type(exc).__name__,
+                )
+
             logger.info(
                 "Lead classification daemon iteration completed iteration=%s "
-                "fetched=%s saved=%s classified=%s failed=%s skipped=%s errors=%s",
+                "fetched=%s saved=%s classified=%s failed=%s skipped=%s errors=%s "
+                "pending_count=%s backoff_count=%s exhausted_count=%s",
                 summary.iterations,
                 batch.fetched,
                 batch.saved,
@@ -323,6 +355,9 @@ async def run_daemon(
                 batch.failed,
                 batch.skipped,
                 batch.errors,
+                queue_metrics.pending_count if queue_metrics else None,
+                queue_metrics.backoff_count if queue_metrics else None,
+                queue_metrics.exhausted_count if queue_metrics else None,
             )
 
             if daemon_settings.run_once or active_shutdown.requested:

@@ -14,6 +14,7 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - AI classification contracts and OpenAI client connected
 - Manual classification runner connected
 - Autonomous classification daemon connected
+- Queue health metrics connected
 - CRM integrations not yet connected
 
 ## Runtime
@@ -35,9 +36,30 @@ The current workstation may temporarily run tests with Python 3.14.3 until Pytho
 ```http
 GET /health
 GET /health/database
+GET /health/queue
 ```
 
 `GET /health/database` performs a read-only Supabase query against the `leads` table. Tests override the database dependency with a mock.
+
+`GET /health/queue` returns aggregate classification queue counters for monitoring:
+
+```json
+{
+  "status": "ok",
+  "pending_count": 3,
+  "backoff_count": 1,
+  "exhausted_count": 0,
+  "max_attempts": 5
+}
+```
+
+When `QUEUE_METRICS_TOKEN` is configured, callers must send:
+
+```http
+Authorization: Bearer <QUEUE_METRICS_TOKEN>
+```
+
+Production requires `QUEUE_METRICS_TOKEN`, so `/health/queue` is protected in deployed environments. The endpoint exposes only aggregate counters and never returns raw lead text, contact details, or lead IDs.
 
 ### Lead Inquiry Contract
 
@@ -275,6 +297,7 @@ Required production environment variables:
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` unless using a compatible gateway |
 | `OPENAI_MODEL` | known supported model, currently `gpt-4.1-mini` |
 | `ALLOWED_ORIGINS` | JSON list of deployed frontend origins only |
+| `QUEUE_METRICS_TOKEN` | generated monitoring token with at least 24 characters |
 | `JWT_SECRET` | generated secret with at least 32 characters |
 | `REQUEST_MAX_BYTES` | request body limit, default `32768` |
 | `DEDUP_WINDOW_DAYS` | idempotency bucket window, default `7` |
@@ -291,8 +314,8 @@ Production deployment checklist:
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Set `ENVIRONMENT=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
 4. Build and start both `api` and `worker` services from the same image.
-5. Verify `GET /health` and `GET /health/database`.
-6. Confirm worker logs show batch counts and no raw customer message text.
+5. Verify `GET /health`, `GET /health/database`, and protected `GET /health/queue`.
+6. Confirm worker logs show batch counts, queue counters, and no raw customer message text.
 7. Monitor repeated daemon errors, retry backlog, exhausted classification attempts, and API healthcheck failures.
 
 Do not use `docker compose config` without `--quiet` in environments with real secrets; the non-quiet command prints resolved environment values.

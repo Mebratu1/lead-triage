@@ -6,7 +6,11 @@ from typing import Any
 
 from supabase import AsyncClient
 
-from app.models.classification import LeadClassified, LeadClassificationStatus
+from app.models.classification import (
+    LeadClassified,
+    LeadClassificationQueueMetrics,
+    LeadClassificationStatus,
+)
 
 LEAD_SELECT_FIELDS = "id,source,classification_status,created_at"
 LEAD_CLASSIFICATION_SELECT_FIELDS = (
@@ -93,6 +97,20 @@ def _rows(response: Any) -> list[dict[str, Any]]:
             return data
     if isinstance(data, dict):
         return [data]
+    raise LeadRepositoryUnexpectedResult
+
+
+def _count(response: Any) -> int:
+    count = getattr(response, "count", None)
+    if isinstance(count, int):
+        return count
+
+    data = getattr(response, "data", None)
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        return 1
+
     raise LeadRepositoryUnexpectedResult
 
 
@@ -239,6 +257,75 @@ async def fetch_pending_leads(
         raise LeadRepositoryLookupError from exc
 
     return rows
+
+
+async def _count_pending_leads(
+    db: AsyncClient,
+    max_attempts: int | None = None,
+    below_max_attempts: int | None = None,
+    backoff_after: datetime | None = None,
+) -> int:
+    """Count pending leads with optional queue-health filters."""
+    try:
+        query = await _resolve(db.table("leads"))
+        query = await _resolve(query.select("id", count="exact"))
+        query = await _resolve(
+            query.eq(
+                "classification_status",
+                LeadClassificationStatus.PENDING.value,
+            )
+        )
+        if max_attempts is not None:
+            query = await _resolve(
+                query.gte("classification_attempt_count", max_attempts)
+            )
+        if below_max_attempts is not None:
+            query = await _resolve(
+                query.lt("classification_attempt_count", below_max_attempts)
+            )
+        if backoff_after is not None:
+            query = await _resolve(
+                query.gt(
+                    "next_classification_attempt_at",
+                    backoff_after.astimezone(UTC).isoformat(),
+                )
+            )
+        query = await _resolve(query.limit(0))
+        response = await _resolve(query.execute())
+        return _count(response)
+    except LeadRepositoryUnexpectedResult as exc:
+        raise LeadRepositoryLookupError from exc
+    except Exception as exc:
+        raise LeadRepositoryLookupError from exc
+
+
+async def fetch_classification_queue_metrics(
+    db: AsyncClient,
+    max_attempts: int,
+    now: datetime | None = None,
+) -> LeadClassificationQueueMetrics:
+    """Fetch aggregate queue health counters for classification monitoring."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+
+    pending_count = await _count_pending_leads(db=db)
+    backoff_count = await _count_pending_leads(
+        db=db,
+        below_max_attempts=max_attempts,
+        backoff_after=current_time,
+    )
+    exhausted_count = await _count_pending_leads(db=db, max_attempts=max_attempts)
+
+    return LeadClassificationQueueMetrics(
+        pending_count=pending_count,
+        backoff_count=backoff_count,
+        exhausted_count=exhausted_count,
+        max_attempts=max_attempts,
+    )
 
 
 async def claim_pending_leads(

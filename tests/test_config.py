@@ -69,6 +69,21 @@ class TestRuntimeSettings:
         with pytest.raises(ValidationError, match="LOG_LEVEL must be one of"):
             build_settings(log_level="verbose")
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize("token", ["", "   "])
+    def test_blank_queue_metrics_token_is_treated_as_unconfigured(self, token):
+        """Test local development can leave QUEUE_METRICS_TOKEN blank."""
+        settings = build_settings(queue_metrics_token=token)
+
+        assert settings.queue_metrics_token is None
+
+    @pytest.mark.unit
+    def test_queue_metrics_token_is_trimmed(self):
+        """Test configured monitoring token is normalized before use."""
+        settings = build_settings(queue_metrics_token="  monitor-token  ")
+
+        assert settings.queue_metrics_token == "monitor-token"
+
 
 class TestProductionSettings:
     """Production startup safety tests."""
@@ -81,6 +96,7 @@ class TestProductionSettings:
             debug=False,
             allowed_origins=["https://app.example.com"],
             jwt_secret="production-secret-value-with-enough-entropy",
+            queue_metrics_token="queue-metrics-token-with-enough-entropy",
         )
 
         assert settings.environment == "production"
@@ -95,6 +111,7 @@ class TestProductionSettings:
                 debug=True,
                 allowed_origins=["https://app.example.com"],
                 jwt_secret="production-secret-value-with-enough-entropy",
+                queue_metrics_token="queue-metrics-token-with-enough-entropy",
             )
 
     @pytest.mark.unit
@@ -117,6 +134,7 @@ class TestProductionSettings:
                 environment="production",
                 allowed_origins=[origin],
                 jwt_secret="production-secret-value-with-enough-entropy",
+                queue_metrics_token="queue-metrics-token-with-enough-entropy",
             )
 
     @pytest.mark.unit
@@ -139,4 +157,20 @@ class TestProductionSettings:
                 environment="production",
                 allowed_origins=["https://app.example.com"],
                 jwt_secret=jwt_secret,
+                queue_metrics_token="queue-metrics-token-with-enough-entropy",
+            )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("token", [None, "", "short-token"])
+    def test_production_requires_queue_metrics_token(self, token):
+        """Test production queue metrics endpoint must be protected."""
+        with pytest.raises(
+            ValidationError,
+            match="QUEUE_METRICS_TOKEN must be configured",
+        ):
+            build_settings(
+                environment="production",
+                allowed_origins=["https://app.example.com"],
+                jwt_secret="production-secret-value-with-enough-entropy",
+                queue_metrics_token=token,
             )
