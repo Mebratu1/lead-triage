@@ -283,6 +283,16 @@ Production startup intentionally fails fast for unsafe configuration. When `ENVI
 - placeholder or short `JWT_SECRET` values
 - blank required service credentials
 
+### Production Environment Validation
+
+Generate production secrets locally and paste them into the hosting provider secret manager. Do not paste real secrets into `README.md`, `docker-compose.yml`, `Dockerfile`, screenshots, logs, tickets, or source control.
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Use one generated value for `JWT_SECRET` and a different generated value for `QUEUE_METRICS_TOKEN`.
+
 Required production environment variables:
 
 | Variable | Production expectation |
@@ -302,21 +312,166 @@ Required production environment variables:
 | `REQUEST_MAX_BYTES` | request body limit, default `32768` |
 | `DEDUP_WINDOW_DAYS` | idempotency bucket window, default `7` |
 
-Generate a production JWT secret:
+Example production values, with fake secret placeholders:
 
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+```env
+ENVIRONMENT=production
+APP_ENV=production
+DEBUG=false
+LOG_LEVEL=INFO
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<server-only-service-role-key>
+OPENAI_API_KEY=<server-only-openai-key>
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+ALLOWED_ORIGINS=["https://your-frontend.example.com"]
+QUEUE_METRICS_TOKEN=<generated-monitoring-token>
+JWT_SECRET=<generated-jwt-secret>
+REQUEST_MAX_BYTES=32768
+DEDUP_WINDOW_DAYS=7
 ```
 
-Production deployment checklist:
+### Production Database Constraints
+
+Before deploying API or worker containers, apply Supabase migrations `001` through `005` in order and verify these database safeguards exist:
+
+- `raw_message`, `source`, `classification_status`, `idempotency_key`, and `deduplication_bucket` support intake persistence.
+- The unique index on `(idempotency_key, deduplication_bucket)` prevents duplicate lead inserts inside the configured deduplication bucket.
+- `classification_status` only allows the lifecycle states used by the backend.
+- `classification_attempt_count >= 0` is enforced.
+- Worker claim columns exist: `classification_claimed_at`, `classification_claimed_by`, `classification_attempt_count`, `last_classification_error`, and `next_classification_attempt_at`.
+- The `claim_pending_leads_for_classification` RPC exists and is executable by the server-side role used by the backend.
+
+Live database verification:
+
+```powershell
+Invoke-RestMethod https://<api-host>/health/database
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "database": "connected"
+}
+```
+
+### Protected Queue Metrics
+
+`GET /health/queue` is intended for monitoring systems, not public dashboards. In production, set `QUEUE_METRICS_TOKEN`; startup validation fails if it is missing or too short.
+
+PowerShell check:
+
+```powershell
+$headers = @{
+    Authorization = "Bearer $env:QUEUE_METRICS_TOKEN"
+}
+
+Invoke-RestMethod `
+    -Uri https://<api-host>/health/queue `
+    -Headers $headers
+```
+
+Expected response shape:
+
+```json
+{
+  "status": "ok",
+  "pending_count": 0,
+  "backoff_count": 0,
+  "exhausted_count": 0,
+  "max_attempts": 5
+}
+```
+
+Monitoring guidance:
+
+- Alert if `/health` or `/health/database` returns non-2xx.
+- Alert if `pending_count` grows continuously while the worker is running.
+- Alert if `backoff_count` stays elevated for several worker cycles.
+- Alert immediately if `exhausted_count` increases.
+- Never log the `Authorization` header or `QUEUE_METRICS_TOKEN`.
+- Treat `pending_count`, `backoff_count`, and `exhausted_count` as aggregate operational metrics only; they intentionally do not expose lead IDs or customer text.
+
+### Cloud Deployment Runbook
+
+Use two runtime services from the same Docker image:
+
+| Service | Public | Command |
+| --- | --- | --- |
+| API | Yes | `uvicorn app.main:app --host 0.0.0.0 --port 8000` |
+| Worker | No | `python -m app.jobs.classification_daemon --worker-id <stable-worker-id> --limit 10 --sleep-seconds 30` |
+
+The API service must expose container port `8000`. The worker should not expose an HTTP port.
+
+#### Render Deployment
+
+Official references: [Docker on Render](https://render.com/docs/docker), [Render web services](https://render.com/docs/web-services), [Render background workers](https://render.com/docs/background-workers), and [Render health checks](https://render.com/docs/health-checks).
+
+1. Push the repository to GitHub, GitLab, or Bitbucket.
+2. In Render, create a new Web Service from the repository.
+3. Set the runtime/language to Docker and keep the Dockerfile path as `Dockerfile`.
+4. Configure the API service:
+   - Name: `lead-triage-api`
+   - Docker command: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+   - Port: `8000`
+   - Health check path: `/health`
+   - Environment variables: all required production variables from the table above
+5. Create a Background Worker from the same repository and Dockerfile.
+6. Configure the worker service:
+   - Name: `lead-triage-worker`
+   - Docker command: `python -m app.jobs.classification_daemon --worker-id render-worker-1 --limit 10 --sleep-seconds 30`
+   - Environment variables: same production variables as the API service
+   - Instances: start with `1` worker until queue metrics show sustained backlog
+7. Deploy the API first, then the worker.
+8. Run smoke checks:
+
+```powershell
+Invoke-RestMethod https://<api-host>/health
+Invoke-RestMethod https://<api-host>/health/database
+
+$headers = @{ Authorization = "Bearer $env:QUEUE_METRICS_TOKEN" }
+Invoke-RestMethod -Uri https://<api-host>/health/queue -Headers $headers
+```
+
+9. Submit one test lead to `POST /api/leads`, confirm it returns `201` or `200`, then confirm the worker eventually reduces `pending_count`.
+
+#### Fly.io Deployment Notes
+
+Official references: [Deploy with a Dockerfile](https://fly.io/docs/languages-and-frameworks/dockerfile/) and [fly deploy](https://fly.io/docs/flyctl/deploy/).
+
+- Use the repository `Dockerfile`.
+- Store secrets with `fly secrets set`; do not put service-role keys in `fly.toml`.
+- Run the API as the public process listening on internal port `8000`.
+- Run the worker as a separate process or separate Fly app with the daemon command.
+- Set a stable worker ID such as `fly-worker-1`.
+- Keep the first deployment to one worker process until queue metrics justify scaling.
+
+#### Railway Deployment Notes
+
+Official references: [Railway variables](https://docs.railway.com/variables) and [Railway environments](https://docs.railway.com/environments).
+
+- Create one service for the API and one service for the worker from the same repository.
+- Use the Dockerfile builder for both services.
+- Add production variables in the Railway Variables tab for each service.
+- Set the API start command to `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+- Set the worker start command to `python -m app.jobs.classification_daemon --worker-id railway-worker-1 --limit 10 --sleep-seconds 30`.
+- Keep production variables scoped to the production environment.
+
+### Deployment Checklist
 
 1. Apply Supabase migrations `001` through `005` in order.
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
-3. Set `ENVIRONMENT=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
-4. Build and start both `api` and `worker` services from the same image.
-5. Verify `GET /health`, `GET /health/database`, and protected `GET /health/queue`.
-6. Confirm worker logs show batch counts, queue counters, and no raw customer message text.
-7. Monitor repeated daemon errors, retry backlog, exhausted classification attempts, and API healthcheck failures.
+3. Confirm `OPENAI_API_KEY` is available only to server containers.
+4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
+5. Set `QUEUE_METRICS_TOKEN` and `JWT_SECRET` to generated, distinct values.
+6. Run `docker compose config --quiet` locally before deploying.
+7. Build and start both API and worker services from the same image.
+8. Verify `GET /health`, `GET /health/database`, and protected `GET /health/queue`.
+9. Submit one test lead and confirm the worker processes it.
+10. Confirm worker logs show batch counts, queue counters, retry/backoff visibility, and no raw customer message text.
+11. Monitor repeated daemon errors, retry backlog, exhausted classification attempts, and API health check failures.
 
 Do not use `docker compose config` without `--quiet` in environments with real secrets; the non-quiet command prints resolved environment values.
 
@@ -357,7 +512,7 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Metrics and alerting for repeated worker failures, retry backlog, and exhausted attempts
-2. Read endpoints or admin views for classified leads
-3. Hosted deployment target configuration
-4. CRM integration from classified lead records
+1. Read endpoints or admin views for classified leads
+2. CRM integration from classified lead records
+3. Alert routing for queue metrics and repeated worker failures
+4. Deployment automation with provider-specific infrastructure files
