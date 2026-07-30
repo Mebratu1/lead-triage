@@ -32,6 +32,10 @@ CLAIMED_LEAD_SELECT_FIELDS = (
     "classification_attempt_count"
 )
 PENDING_LEAD_SELECT_FIELDS = "id,raw_message,source,classification_status,created_at"
+LEAD_PUBLIC_SELECT_FIELDS = (
+    "id,source,raw_message,customer_name,email,phone,classification_status,"
+    "urgency,ai_summary,classification_attempt_count,created_at,classified_at"
+)
 SAFE_FAILURE_REASONS = {
     "invalid_json",
     "invalid_json_shape",
@@ -156,6 +160,13 @@ def _retry_timestamp_value(now: datetime | None, retry_after_seconds: int) -> st
         retry_base = retry_base.replace(tzinfo=UTC)
     retry_at = retry_base.astimezone(UTC) + timedelta(seconds=retry_after_seconds)
     return retry_at.isoformat()
+
+
+def _utc_isoformat(value: datetime) -> str:
+    """Render a datetime as a stable UTC ISO timestamp for Supabase filters."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
 
 
 def _classification_update_payload(
@@ -326,6 +337,67 @@ async def fetch_classification_queue_metrics(
         exhausted_count=exhausted_count,
         max_attempts=max_attempts,
     )
+
+
+async def list_leads(
+    db: AsyncClient,
+    limit: int,
+    offset: int,
+    classification_status: str | None = None,
+    urgency: str | None = None,
+    source: str | None = None,
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """List admin-visible leads with optional filters and total count."""
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
+    if offset < 0:
+        raise ValueError("offset must be at least 0")
+
+    try:
+        query = await _resolve(db.table("leads"))
+        query = await _resolve(query.select(LEAD_PUBLIC_SELECT_FIELDS, count="exact"))
+        if classification_status is not None:
+            query = await _resolve(
+                query.eq("classification_status", classification_status)
+            )
+        if urgency is not None:
+            query = await _resolve(query.eq("urgency", urgency))
+        if source is not None:
+            query = await _resolve(query.eq("source", source))
+        if start_date is not None:
+            query = await _resolve(query.gte("created_at", _utc_isoformat(start_date)))
+        if end_date is not None:
+            query = await _resolve(query.lte("created_at", _utc_isoformat(end_date)))
+        query = await _resolve(query.order("created_at", desc=True))
+        query = await _resolve(query.range(offset, offset + limit - 1))
+        response = await _resolve(query.execute())
+        rows = _rows(response)
+        total = _count(response)
+    except LeadRepositoryUnexpectedResult as exc:
+        raise LeadRepositoryLookupError from exc
+    except Exception as exc:
+        raise LeadRepositoryLookupError from exc
+
+    return rows, total
+
+
+async def get_lead_by_id(
+    db: AsyncClient,
+    lead_id: str,
+) -> dict[str, Any] | None:
+    """Fetch one admin-visible lead by UUID."""
+    try:
+        query = await _resolve(db.table("leads"))
+        query = await _resolve(query.select(LEAD_PUBLIC_SELECT_FIELDS))
+        query = await _resolve(query.eq("id", lead_id))
+        query = await _resolve(query.limit(1))
+        response = await _resolve(query.execute())
+    except Exception as exc:
+        raise LeadRepositoryLookupError from exc
+
+    return _first_row(response)
 
 
 async def claim_pending_leads(

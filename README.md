@@ -15,6 +15,7 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Manual classification runner connected
 - Autonomous classification daemon connected
 - Queue health metrics connected
+- Admin lead read API foundation connected
 - CRM integrations not yet connected
 
 ## Runtime
@@ -110,6 +111,43 @@ Duplicate response:
 ```
 
 The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a duplicate that returns an existing lead. It saves the lead with `classification_status = "pending"` and does not echo the full raw customer message. The API route does not call OpenAI, generate fake classification values, or push to a CRM; classification is handled separately by the worker jobs.
+
+### Admin Lead Read API
+
+```http
+GET /api/leads
+GET /api/leads/{id}
+```
+
+Both read endpoints require:
+
+```http
+X-Admin-Token: <QUEUE_METRICS_TOKEN>
+```
+
+Supported list query parameters:
+
+- `classification_status`: `pending`, `classified`, or `failed`
+- `urgency`: `hot`, `warm`, or `cold`
+- `source`: normalized source label
+- `start_date`: inclusive `created_at` lower bound
+- `end_date`: inclusive `created_at` upper bound
+- `limit`: `1` to `100`, default `50`
+- `offset`: `0` or greater, default `0`
+
+Example:
+
+```powershell
+$headers = @{
+    "X-Admin-Token" = $env:QUEUE_METRICS_TOKEN
+}
+
+Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8000/api/leads?classification_status=classified&limit=25" `
+    -Headers $headers
+```
+
+Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, or retry error details.
 
 ## Idempotency
 
@@ -512,7 +550,7 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Read endpoints or admin views for classified leads
+1. Admin dashboard UI for classified lead review
 2. CRM integration from classified lead records
 3. Alert routing for queue metrics and repeated worker failures
 4. Deployment automation with provider-specific infrastructure files
