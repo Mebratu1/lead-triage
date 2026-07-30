@@ -16,8 +16,8 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Autonomous classification daemon connected
 - Queue health metrics connected
 - Admin lead read API foundation connected
-- Browser admin dashboard shell connected
-- CRM sync tracking and CSV export foundation connected
+- Browser admin dashboard interactions and richer lead detail views connected
+- CRM sync tracking and filtered CSV export connected
 
 ## Runtime
 
@@ -169,12 +169,15 @@ Read responses intentionally expose only the admin-safe fields needed for review
 GET /admin
 ```
 
-The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to store it in browser `localStorage` and load queue metrics plus protected lead data from the existing JSON endpoints.
+The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to store it in browser `localStorage` and load queue metrics plus protected lead data from the existing endpoints. The lead table opens a full admin-safe detail view, classified leads can be deliberately synced through the existing CRM boundary, and CSV exports reuse the active status and urgency filters.
 
 The page uses:
 
 - `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /health/queue`
 - `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads`
+- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads/{id}`
+- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `POST /api/leads/{id}/sync`
+- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads/export/csv`
 
 ## Idempotency
 
@@ -585,7 +588,6 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Admin dashboard interaction hardening and richer lead detail views
-2. Vendor-specific CRM adapter or webhook delivery from the sync boundary
-3. Alert routing for queue metrics and repeated worker failures
-4. Deployment automation with provider-specific infrastructure files
+1. Vendor-specific CRM adapter or webhook delivery from the sync boundary
+2. Alert routing for queue metrics and repeated worker failures
+3. Deployment automation with provider-specific infrastructure files
