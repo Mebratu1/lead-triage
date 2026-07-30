@@ -3,10 +3,16 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+SAFE_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+INSECURE_JWT_SECRETS = {
+    "dev-secret-key-change-in-production",
+    "your-secret-key-change-in-production",
+    "your-secret-key-here",
+}
 
 
 class Settings(BaseSettings):
@@ -54,14 +60,62 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_hours: int = 24
 
-    @field_validator("openai_model")
+    @field_validator(
+        "supabase_url",
+        "supabase_service_role_key",
+        "openai_api_key",
+        "openai_base_url",
+        "openai_model",
+        "jwt_secret",
+    )
     @classmethod
-    def openai_model_must_not_be_blank(cls, value: str) -> str:
-        """Avoid sending empty model names to the OpenAI API."""
+    def required_strings_must_not_be_blank(cls, value: str) -> str:
+        """Reject blank strings for required runtime settings."""
         cleaned = value.strip()
         if not cleaned:
-            raise ValueError("OPENAI_MODEL must not be blank")
+            raise ValueError("required setting must not be blank")
         return cleaned
+
+    @field_validator("log_level")
+    @classmethod
+    def log_level_must_be_supported(cls, value: str) -> str:
+        """Normalize and validate log level names."""
+        cleaned = value.strip().upper()
+        if cleaned not in SAFE_LOG_LEVELS:
+            raise ValueError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
+        return cleaned
+
+    @model_validator(mode="after")
+    def production_settings_must_be_safe(self) -> "Settings":
+        """Fail fast on unsafe production configuration."""
+        if self.environment != "production":
+            return self
+
+        if self.debug:
+            raise ValueError("DEBUG must be false in production")
+
+        if self.jwt_secret in INSECURE_JWT_SECRETS or len(self.jwt_secret) < 32:
+            raise ValueError(
+                "JWT_SECRET must be a generated secret with at least 32 characters "
+                "in production"
+            )
+
+        if not self.allowed_origins:
+            raise ValueError("ALLOWED_ORIGINS must not be empty in production")
+
+        insecure_origins = {"*", "http://localhost:3000", "http://localhost:8000"}
+        for origin in self.allowed_origins:
+            normalized_origin = origin.strip().rstrip("/")
+            if (
+                normalized_origin in insecure_origins
+                or normalized_origin.startswith("http://127.0.0.1")
+                or normalized_origin.startswith("http://localhost")
+            ):
+                raise ValueError(
+                    "ALLOWED_ORIGINS must use explicit production origins in production"
+                )
+
+        return self
 
 
 @lru_cache()

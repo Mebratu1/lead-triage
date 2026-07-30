@@ -252,6 +252,51 @@ Stop the stack:
 docker compose down
 ```
 
+## Production Readiness
+
+Production startup intentionally fails fast for unsafe configuration. When `ENVIRONMENT=production`, the app rejects:
+
+- `DEBUG=true`
+- wildcard, localhost, or `127.0.0.1` CORS origins
+- placeholder or short `JWT_SECRET` values
+- blank required service credentials
+
+Required production environment variables:
+
+| Variable | Production expectation |
+| --- | --- |
+| `ENVIRONMENT` | `production` |
+| `APP_ENV` | `production` |
+| `DEBUG` | `false` |
+| `LOG_LEVEL` | `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | server-only service-role key |
+| `OPENAI_API_KEY` | server-only OpenAI API key |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` unless using a compatible gateway |
+| `OPENAI_MODEL` | known supported model, currently `gpt-4.1-mini` |
+| `ALLOWED_ORIGINS` | JSON list of deployed frontend origins only |
+| `JWT_SECRET` | generated secret with at least 32 characters |
+| `REQUEST_MAX_BYTES` | request body limit, default `32768` |
+| `DEDUP_WINDOW_DAYS` | idempotency bucket window, default `7` |
+
+Generate a production JWT secret:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Production deployment checklist:
+
+1. Apply Supabase migrations `001` through `005` in order.
+2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
+3. Set `ENVIRONMENT=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
+4. Build and start both `api` and `worker` services from the same image.
+5. Verify `GET /health` and `GET /health/database`.
+6. Confirm worker logs show batch counts and no raw customer message text.
+7. Monitor repeated daemon errors, retry backlog, exhausted classification attempts, and API healthcheck failures.
+
+Do not use `docker compose config` without `--quiet` in environments with real secrets; the non-quiet command prints resolved environment values.
+
 ## Development Verification
 
 ```powershell
@@ -289,8 +334,7 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Deployment/runbook hardening for the classification daemon
-2. Metrics and alerting for repeated worker failures, retry backlog, and exhausted attempts
-3. Read endpoints or admin views for classified leads
+1. Metrics and alerting for repeated worker failures, retry backlog, and exhausted attempts
+2. Read endpoints or admin views for classified leads
+3. Hosted deployment target configuration
 4. CRM integration from classified lead records
-5. Hosted deployment configuration
