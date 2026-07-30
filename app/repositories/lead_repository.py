@@ -11,6 +11,7 @@ from app.models.classification import (
     LeadClassificationQueueMetrics,
     LeadClassificationStatus,
 )
+from app.models.lead import LeadIntegrationStatus
 
 LEAD_SELECT_FIELDS = "id,source,classification_status,created_at"
 LEAD_CLASSIFICATION_SELECT_FIELDS = (
@@ -34,7 +35,12 @@ CLAIMED_LEAD_SELECT_FIELDS = (
 PENDING_LEAD_SELECT_FIELDS = "id,raw_message,source,classification_status,created_at"
 LEAD_PUBLIC_SELECT_FIELDS = (
     "id,source,raw_message,customer_name,email,phone,classification_status,"
-    "urgency,ai_summary,classification_attempt_count,created_at,classified_at"
+    "urgency,ai_summary,classification_attempt_count,created_at,classified_at,"
+    "integration_status,integration_last_synced_at"
+)
+LEAD_INTEGRATION_SELECT_FIELDS = (
+    "id,integration_status,integration_last_synced_at,integration_error,"
+    "integration_next_attempt_at"
 )
 SAFE_FAILURE_REASONS = {
     "invalid_json",
@@ -47,6 +53,11 @@ SAFE_FAILURE_REASONS = {
 SAFE_RETRY_REASONS = {
     "classification_client_error",
     "classification_update_failed",
+}
+SAFE_INTEGRATION_REASONS = {
+    "crm_dispatch_failed",
+    "crm_sync_failed",
+    "crm_update_failed",
 }
 
 
@@ -144,6 +155,12 @@ def _safe_retry_reason(reason: str | None) -> str:
     return "classification_retry_failed"
 
 
+def _safe_integration_reason(reason: str | None) -> str:
+    if reason in SAFE_INTEGRATION_REASONS:
+        return reason
+    return "crm_sync_failed"
+
+
 def _terminal_timestamp_value(classified_at: datetime | None) -> str:
     terminal_timestamp = classified_at or datetime.now(UTC)
     if terminal_timestamp.tzinfo is None:
@@ -218,6 +235,43 @@ def _classification_update_payload(
         }
 
     raise LeadRepositoryUpdateError("classification result must be classified or failed")
+
+
+def _integration_update_payload(
+    integration_status: LeadIntegrationStatus,
+    error_reason: str | None,
+    synced_at: datetime | None,
+    retry_after_seconds: int | None,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """Build a safe outbound CRM sync tracking update payload."""
+    if integration_status == LeadIntegrationStatus.SYNCED:
+        return {
+            "integration_status": LeadIntegrationStatus.SYNCED.value,
+            "integration_last_synced_at": _terminal_timestamp_value(synced_at),
+            "integration_error": None,
+            "integration_next_attempt_at": None,
+        }
+
+    if integration_status == LeadIntegrationStatus.FAILED:
+        if retry_after_seconds is None:
+            retry_after_seconds = 300
+        return {
+            "integration_status": LeadIntegrationStatus.FAILED.value,
+            "integration_last_synced_at": None,
+            "integration_error": _safe_integration_reason(error_reason),
+            "integration_next_attempt_at": _retry_timestamp_value(
+                now=now,
+                retry_after_seconds=retry_after_seconds,
+            ),
+        }
+
+    return {
+        "integration_status": LeadIntegrationStatus.PENDING.value,
+        "integration_last_synced_at": None,
+        "integration_error": None,
+        "integration_next_attempt_at": None,
+    }
 
 
 async def find_by_idempotency(
@@ -350,8 +404,8 @@ async def list_leads(
     end_date: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """List admin-visible leads with optional filters and total count."""
-    if limit < 1 or limit > 100:
-        raise ValueError("limit must be between 1 and 100")
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
     if offset < 0:
         raise ValueError("offset must be at least 0")
 
@@ -398,6 +452,40 @@ async def get_lead_by_id(
         raise LeadRepositoryLookupError from exc
 
     return _first_row(response)
+
+
+async def update_lead_integration_status(
+    db: AsyncClient,
+    lead_id: str,
+    integration_status: LeadIntegrationStatus,
+    error_reason: str | None = None,
+    synced_at: datetime | None = None,
+    retry_after_seconds: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Update outbound CRM sync tracking fields for an existing lead."""
+    payload = _integration_update_payload(
+        integration_status=integration_status,
+        error_reason=error_reason,
+        synced_at=synced_at,
+        retry_after_seconds=retry_after_seconds,
+        now=now,
+    )
+
+    try:
+        query = await _resolve(db.table("leads"))
+        query = await _resolve(query.update(payload))
+        query = await _resolve(query.eq("id", lead_id))
+        query = await _resolve(query.select(LEAD_INTEGRATION_SELECT_FIELDS))
+        response = await _resolve(query.execute())
+    except Exception as exc:
+        raise LeadRepositoryUpdateError from exc
+
+    row = _first_row(response)
+    if row is None:
+        raise LeadRepositoryUpdateConflict
+
+    return row
 
 
 async def claim_pending_leads(

@@ -17,7 +17,7 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Queue health metrics connected
 - Admin lead read API foundation connected
 - Browser admin dashboard shell connected
-- CRM integrations not yet connected
+- CRM sync tracking and CSV export foundation connected
 
 ## Runtime
 
@@ -124,6 +124,8 @@ The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a dup
 ```http
 GET /api/leads
 GET /api/leads/{id}
+GET /api/leads/export/csv
+POST /api/leads/{id}/sync
 ```
 
 Both read endpoints require:
@@ -135,6 +137,7 @@ X-Admin-Token: <QUEUE_METRICS_TOKEN>
 Supported list query parameters:
 
 - `classification_status`: `pending`, `classified`, or `failed`
+- `status`: shorthand alias for `classification_status`
 - `urgency`: `hot`, `warm`, or `cold`
 - `source`: normalized source label
 - `start_date`: inclusive `created_at` lower bound
@@ -154,7 +157,11 @@ Invoke-RestMethod `
     -Headers $headers
 ```
 
-Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, or retry error details.
+Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, sync status, sync timestamp, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, raw integration errors, or retry error details.
+
+`GET /api/leads/export/csv` accepts the same filters as the lead list endpoint plus bounded `limit` and `offset` controls. The CSV includes only `ID`, `Source`, `Customer Name`, `Customer Email`, `Customer Phone`, `Status`, `Urgency`, `Summary`, and `Created At`.
+
+`POST /api/leads/{id}/sync` records outbound CRM sync tracking for classified leads only. The current dispatcher is a safe adapter boundary with no vendor-specific network call yet; failures are stored as sanitized integration reasons with a retry timestamp, not raw exception text.
 
 ### Browser Admin Dashboard
 
@@ -195,6 +202,7 @@ Apply migrations in order:
 3. `app/db/migrations/003_relax_legacy_lead_required_columns.sql` relaxes required legacy customer fields that intake intentionally does not populate.
 4. `app/db/migrations/004_classification_tracking_columns.sql` adds classified output, error, timestamp, and model tracking columns.
 5. `app/db/migrations/005_classification_claim_retry.sql` adds worker claim ownership, attempt counts, retry backoff, indexes, and the atomic claim RPC.
+6. `app/db/migrations/006_integration_sync_tracking.sql` adds outbound CRM sync status, last sync timestamp, sanitized error, retry timestamp, constraints, and indexes.
 
 - `id`
 - `idempotency_key`
@@ -217,6 +225,10 @@ Apply migrations in order:
 - `classification_attempt_count`
 - `last_classification_error`
 - `next_classification_attempt_at`
+- `integration_status`
+- `integration_last_synced_at`
+- `integration_error`
+- `integration_next_attempt_at`
 - `created_at`
 
 The request field `message` is stored as `raw_message`.
@@ -391,7 +403,7 @@ DEDUP_WINDOW_DAYS=7
 
 ### Production Database Constraints
 
-Before deploying API or worker containers, apply Supabase migrations `001` through `005` in order and verify these database safeguards exist:
+Before deploying API or worker containers, apply Supabase migrations `001` through `006` in order and verify these database safeguards exist:
 
 - `raw_message`, `source`, `classification_status`, `idempotency_key`, and `deduplication_bucket` support intake persistence.
 - The unique index on `(idempotency_key, deduplication_bucket)` prevents duplicate lead inserts inside the configured deduplication bucket.
@@ -399,6 +411,7 @@ Before deploying API or worker containers, apply Supabase migrations `001` throu
 - `classification_attempt_count >= 0` is enforced.
 - Worker claim columns exist: `classification_claimed_at`, `classification_claimed_by`, `classification_attempt_count`, `last_classification_error`, and `next_classification_attempt_at`.
 - The `claim_pending_leads_for_classification` RPC exists and is executable by the server-side role used by the backend.
+- Integration sync columns exist: `integration_status`, `integration_last_synced_at`, `integration_error`, and `integration_next_attempt_at`.
 
 Live database verification:
 
@@ -521,7 +534,7 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 
 ### Deployment Checklist
 
-1. Apply Supabase migrations `001` through `005` in order.
+1. Apply Supabase migrations `001` through `006` in order.
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Confirm `OPENAI_API_KEY` is available only to server containers.
 4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
@@ -573,6 +586,6 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 Next implementation work should add, in order:
 
 1. Admin dashboard interaction hardening and richer lead detail views
-2. CRM integration from classified lead records
+2. Vendor-specific CRM adapter or webhook delivery from the sync boundary
 3. Alert routing for queue metrics and repeated worker failures
 4. Deployment automation with provider-specific infrastructure files

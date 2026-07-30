@@ -6,6 +6,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from app.models.lead import LeadIntegrationStatus
+
 
 class HealthCheckResponse(BaseModel):
     """Health check response."""
@@ -48,6 +50,8 @@ class LeadPublicResponse(BaseModel):
     urgency: Literal["hot", "warm", "cold"] | None
     summary: str | None
     classification_attempt_count: int
+    integration_status: LeadIntegrationStatus
+    integration_last_synced_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -61,3 +65,15 @@ class LeadListResponse(BaseModel):
     limit: int
     offset: int
     items: list[LeadPublicResponse]
+
+
+class LeadSyncResponse(BaseModel):
+    """Admin-safe response for one outbound lead sync attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    integration_status: LeadIntegrationStatus
+    integration_last_synced_at: datetime | None
+    retry_after_seconds: int | None = None
+    detail: str

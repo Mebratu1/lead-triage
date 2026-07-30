@@ -312,12 +312,16 @@ class TestLeadReadApi:
             "urgency",
             "summary",
             "classification_attempt_count",
+            "integration_status",
+            "integration_last_synced_at",
             "created_at",
             "updated_at",
         }
         assert body["customer_email"] == "maria@example.com"
         assert body["customer_phone"] == "301-555-0144"
         assert body["message"] == "Hi, I need emergency plumbing today."
+        assert body["integration_status"] == "pending"
+        assert body["integration_last_synced_at"] is None
         assert body["updated_at"] == "2026-07-30T12:30:00Z"
         assert "idempotency_key" not in response.text
         assert "deduplication_bucket" not in response.text

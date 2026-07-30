@@ -1,5 +1,6 @@
 """Lead request and response models."""
 
+from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 from datetime import datetime
@@ -65,3 +66,11 @@ class LeadPersistedResponse(BaseModel):
     classification_status: Literal["pending", "classified", "failed"]
     created_at: datetime
     duplicate: bool
+
+
+class LeadIntegrationStatus(StrEnum):
+    """Lifecycle status for outbound CRM synchronization."""
+
+    PENDING = "pending"
+    SYNCED = "synced"
+    FAILED = "failed"
