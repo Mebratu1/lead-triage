@@ -207,6 +207,51 @@ Run the long-lived daemon:
 
 The daemon handles `SIGINT` and `SIGTERM` gracefully: an active batch is allowed to finish before the process exits. Standard logs include counts, worker IDs, model names, retry/backoff events, and error types, but never full raw customer messages.
 
+## Docker
+
+The Docker image uses the same application code for both services. `docker-compose.yml` starts:
+
+- `api`: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+- `worker`: `python -m app.jobs.classification_daemon --worker-id docker-worker-1`
+
+Both services read environment variables from `.env`. Keep `.env` local only; it contains Supabase and OpenAI secrets and is excluded from Git and Docker build context.
+
+Validate the Compose file without printing resolved secret values:
+
+```powershell
+docker compose config --quiet
+```
+
+Build the image:
+
+```powershell
+docker compose build
+```
+
+Start both services:
+
+```powershell
+docker compose up -d api worker
+```
+
+Verify the API health endpoint:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+Inspect daemon activity without exposing raw customer messages:
+
+```powershell
+docker compose logs --tail 50 worker
+```
+
+Stop the stack:
+
+```powershell
+docker compose down
+```
+
 ## Development Verification
 
 ```powershell

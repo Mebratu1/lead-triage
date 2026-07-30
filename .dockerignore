@@ -1,0 +1,39 @@
+# Git and local tooling
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.tox
+.venv
+venv
+env
+ENV
+
+# Python build/cache output
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+build
+dist
+*.egg-info
+.coverage
+htmlcov
+
+# Local secrets and generated data
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+
+# Editor and OS files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
