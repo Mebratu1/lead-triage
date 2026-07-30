@@ -146,6 +146,11 @@ class TestAdminDashboard:
         assert "queueAbortController.abort()" in html
         assert "leadListAbortController.abort()" in html
         assert "detailAbortController.abort()" in html
+        assert "syncAbortController.abort()" in html
+        assert "exportAbortController.abort()" in html
+        assert "function cancelProtectedRequests()" in html
+        assert "cancelProtectedRequests();" in html
+        assert "signal: requestController.signal" in html
         assert 'error.name === "AbortError"' in html
         assert 'selectedLead.classification_status !== "classified"' in html
         assert "const confirmed = window.confirm(" in html

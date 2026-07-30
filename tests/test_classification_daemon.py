@@ -20,6 +20,8 @@ from app.jobs.classification_daemon import (
     settings_from_args,
 )
 from app.models.classification import LeadClassificationBatchResult
+from app.models.classification import LeadClassificationQueueMetrics
+from app.services.alert_routing import AlertEvent
 
 
 class FakeDaemonClient:
@@ -35,6 +37,16 @@ class FakeDaemonClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class RecordingAlertRouter:
+    """Capture daemon-routed worker incidents."""
+
+    def __init__(self) -> None:
+        self.events: list[AlertEvent] = []
+
+    async def route_alert(self, event: AlertEvent) -> None:
+        self.events.append(event)
 
 
 def batch_result(
@@ -275,6 +287,48 @@ class TestClassificationDaemonLoop:
 
         assert calls["db_closed"] is False
         assert client.closed is False
+
+    @pytest.mark.unit
+    def test_daemon_routes_stalled_queue_alert(self):
+        """Test queue metrics and no-progress batches feed the alert monitor."""
+        shutdown = ShutdownFlag()
+        router = RecordingAlertRouter()
+        calls = {"sleep": 0}
+
+        async def process_batch(db, client, settings):
+            return batch_result(fetched=2)
+
+        async def fetch_queue_metrics(db, max_attempts):
+            return LeadClassificationQueueMetrics(
+                pending_count=7,
+                backoff_count=0,
+                exhausted_count=0,
+                max_attempts=max_attempts,
+            )
+
+        async def sleep(seconds: float):
+            calls["sleep"] += 1
+            if calls["sleep"] == 2:
+                shutdown.request()
+
+        asyncio.run(
+            run_daemon(
+                daemon_settings=DaemonSettings(
+                    alert_stalled_queue_iterations=2,
+                ),
+                shutdown=shutdown,
+                db=object(),
+                client=FakeDaemonClient(),
+                process_batch=process_batch,
+                fetch_queue_metrics=fetch_queue_metrics,
+                alert_router=router,
+                sleep=sleep,
+            )
+        )
+
+        assert [event.alert_type for event in router.events] == [
+            "worker.queue_stalled"
+        ]
 
     @pytest.mark.unit
     def test_signal_handlers_request_graceful_shutdown(self, monkeypatch):

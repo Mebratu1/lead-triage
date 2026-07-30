@@ -12,6 +12,10 @@ from typing import Any, TYPE_CHECKING
 import pytest
 
 from app.db.client import get_db
+from app.services.crm_sync import (
+    CrmDeliveryPermanentError,
+    CrmDeliveryRetryableError,
+)
 
 if TYPE_CHECKING:
     from starlette.testclient import TestClient
@@ -400,9 +404,21 @@ class TestLeadCrmSync:
     """Outbound CRM sync tracking route tests."""
 
     @pytest.mark.unit
-    def test_sync_classified_lead_marks_integration_synced(self, client: TestClient):
+    def test_sync_classified_lead_marks_integration_synced(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ):
         """Test successful sync records safe integration tracking fields."""
         database = FakeCrmExportDatabase(rows=read_rows())
+
+        async def successful_dispatch(lead):
+            return None
+
+        monkeypatch.setattr(
+            "app.api.routes.leads.dispatch_lead_to_crm",
+            successful_dispatch,
+        )
 
         response = post_with_db(
             client,
@@ -420,6 +436,7 @@ class TestLeadCrmSync:
         assert database.rows[0]["integration_status"] == "synced"
         assert database.rows[0]["integration_error"] is None
         assert database.rows[0]["integration_next_attempt_at"] is None
+        assert database.rows[0]["integration_retry_attempt_count"] == 0
 
     @pytest.mark.unit
     def test_sync_rejects_unclassified_leads(self, client: TestClient):
@@ -457,7 +474,29 @@ class TestLeadCrmSync:
         assert response.json() == {"detail": "Admin access required"}
 
     @pytest.mark.unit
-    def test_sync_dispatch_failure_records_safe_retry_state(
+    def test_sync_without_crm_configuration_fails_closed(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ):
+        """Test unconfigured CRM delivery cannot be recorded as successful."""
+        database = FakeCrmExportDatabase(rows=read_rows())
+        monkeypatch.setattr("app.services.crm_sync.settings.crm_webhook_url", None)
+        monkeypatch.setattr("app.services.crm_sync.settings.crm_webhook_secret", None)
+
+        response = post_with_db(
+            client,
+            database,
+            "/api/leads/11111111-1111-4111-8111-111111111111/sync",
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "CRM integration is not configured"}
+        assert database.updated_payloads == []
+        assert database.rows[0]["integration_status"] == "pending"
+
+    @pytest.mark.unit
+    def test_sync_dispatch_failure_records_manual_retry_state(
         self,
         client: TestClient,
         monkeypatch,
@@ -485,23 +524,107 @@ class TestLeadCrmSync:
         body = response.json()
         assert body["integration_status"] == "failed"
         assert body["integration_last_synced_at"] is None
-        assert body["retry_after_seconds"] == 300
-        assert body["detail"] == "CRM sync failed; retry scheduled"
+        assert body["retry_after_seconds"] is None
+        assert body["detail"] == "CRM sync failed; manual retry required"
         assert database.rows[0]["integration_status"] == "failed"
         assert database.rows[0]["integration_error"] == "crm_dispatch_failed"
-        assert database.rows[0]["integration_next_attempt_at"] is not None
+        assert database.rows[0]["integration_next_attempt_at"] is None
         assert "raw customer message" not in response.text
         assert "test-service-role-key" not in response.text
         assert "301-555-0144" not in caplog.text
         assert "test-service-role-key" not in caplog.text
 
     @pytest.mark.unit
-    def test_sync_update_failure_is_safe(self, client: TestClient):
+    def test_retryable_sync_failure_schedules_worker_retry(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ):
+        """Test HTTP 429/5xx-class failures enter the integration retry queue."""
+        database = FakeCrmExportDatabase(rows=read_rows())
+
+        async def retryable_dispatch(lead):
+            raise CrmDeliveryRetryableError(
+                "crm_retryable_response",
+                status_code=503,
+            )
+
+        monkeypatch.setattr(
+            "app.api.routes.leads.dispatch_lead_to_crm",
+            retryable_dispatch,
+        )
+        monkeypatch.setattr(
+            "app.api.routes.leads.settings.crm_retry_base_seconds",
+            45,
+        )
+
+        response = post_with_db(
+            client,
+            database,
+            "/api/leads/11111111-1111-4111-8111-111111111111/sync",
+        )
+
+        assert response.status_code == 502
+        assert response.json()["retry_after_seconds"] == 45
+        assert response.json()["detail"] == "CRM sync failed; retry scheduled"
+        assert database.rows[0]["integration_error"] == "crm_retryable_failure"
+        assert database.rows[0]["integration_next_attempt_at"] is not None
+        assert database.rows[0]["integration_retry_attempt_count"] == 0
+
+    @pytest.mark.unit
+    def test_permanent_sync_failure_is_not_scheduled(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ):
+        """Test non-429 4xx-class failures require manual intervention."""
+        database = FakeCrmExportDatabase(rows=read_rows())
+
+        async def permanent_dispatch(lead):
+            raise CrmDeliveryPermanentError(
+                "crm_permanent_response",
+                status_code=422,
+            )
+
+        monkeypatch.setattr(
+            "app.api.routes.leads.dispatch_lead_to_crm",
+            permanent_dispatch,
+        )
+
+        response = post_with_db(
+            client,
+            database,
+            "/api/leads/11111111-1111-4111-8111-111111111111/sync",
+        )
+
+        assert response.status_code == 502
+        assert response.json()["retry_after_seconds"] is None
+        assert (
+            response.json()["detail"]
+            == "CRM sync rejected; manual intervention required"
+        )
+        assert database.rows[0]["integration_error"] == "crm_permanent_failure"
+        assert database.rows[0]["integration_next_attempt_at"] is None
+
+    @pytest.mark.unit
+    def test_sync_update_failure_is_safe(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ):
         """Test database update failures during sync return a safe service error."""
         database = FakeCrmExportDatabase(
             rows=read_rows(),
             fail_update=True,
             failure_message="update failed with test-service-role-key and SQL text",
+        )
+
+        async def successful_dispatch(lead):
+            return None
+
+        monkeypatch.setattr(
+            "app.api.routes.leads.dispatch_lead_to_crm",
+            successful_dispatch,
         )
 
         response = post_with_db(

@@ -40,7 +40,12 @@ LEAD_PUBLIC_SELECT_FIELDS = (
 )
 LEAD_INTEGRATION_SELECT_FIELDS = (
     "id,integration_status,integration_last_synced_at,integration_error,"
-    "integration_next_attempt_at"
+    "integration_next_attempt_at,integration_retry_attempt_count,"
+    "integration_claimed_at,integration_claimed_by"
+)
+CLAIMED_CRM_LEAD_SELECT_FIELDS = (
+    f"{LEAD_PUBLIC_SELECT_FIELDS},integration_next_attempt_at,"
+    "integration_retry_attempt_count,integration_claimed_at,integration_claimed_by"
 )
 SAFE_FAILURE_REASONS = {
     "invalid_json",
@@ -58,6 +63,11 @@ SAFE_INTEGRATION_REASONS = {
     "crm_dispatch_failed",
     "crm_sync_failed",
     "crm_update_failed",
+    "crm_retryable_failure",
+    "crm_permanent_failure",
+    "crm_retry_exhausted",
+    "crm_not_configured",
+    "crm_invalid_payload",
 }
 
 
@@ -243,34 +253,49 @@ def _integration_update_payload(
     synced_at: datetime | None,
     retry_after_seconds: int | None,
     now: datetime | None,
+    reset_retry_attempts: bool,
 ) -> dict[str, Any]:
     """Build a safe outbound CRM sync tracking update payload."""
     if integration_status == LeadIntegrationStatus.SYNCED:
-        return {
+        payload = {
             "integration_status": LeadIntegrationStatus.SYNCED.value,
             "integration_last_synced_at": _terminal_timestamp_value(synced_at),
             "integration_error": None,
             "integration_next_attempt_at": None,
+            "integration_claimed_at": None,
+            "integration_claimed_by": None,
         }
+        if reset_retry_attempts:
+            payload["integration_retry_attempt_count"] = 0
+        return payload
 
     if integration_status == LeadIntegrationStatus.FAILED:
-        if retry_after_seconds is None:
-            retry_after_seconds = 300
-        return {
+        next_attempt_at = None
+        if retry_after_seconds is not None:
+            next_attempt_at = _retry_timestamp_value(
+                now=now,
+                retry_after_seconds=retry_after_seconds,
+            )
+        payload = {
             "integration_status": LeadIntegrationStatus.FAILED.value,
             "integration_last_synced_at": None,
             "integration_error": _safe_integration_reason(error_reason),
-            "integration_next_attempt_at": _retry_timestamp_value(
-                now=now,
-                retry_after_seconds=retry_after_seconds,
-            ),
+            "integration_next_attempt_at": next_attempt_at,
+            "integration_claimed_at": None,
+            "integration_claimed_by": None,
         }
+        if reset_retry_attempts:
+            payload["integration_retry_attempt_count"] = 0
+        return payload
 
     return {
         "integration_status": LeadIntegrationStatus.PENDING.value,
         "integration_last_synced_at": None,
         "integration_error": None,
         "integration_next_attempt_at": None,
+        "integration_retry_attempt_count": 0,
+        "integration_claimed_at": None,
+        "integration_claimed_by": None,
     }
 
 
@@ -462,6 +487,8 @@ async def update_lead_integration_status(
     synced_at: datetime | None = None,
     retry_after_seconds: int | None = None,
     now: datetime | None = None,
+    claim_owner_id: str | None = None,
+    reset_retry_attempts: bool = False,
 ) -> dict[str, Any]:
     """Update outbound CRM sync tracking fields for an existing lead."""
     payload = _integration_update_payload(
@@ -470,12 +497,15 @@ async def update_lead_integration_status(
         synced_at=synced_at,
         retry_after_seconds=retry_after_seconds,
         now=now,
+        reset_retry_attempts=reset_retry_attempts,
     )
 
     try:
         query = await _resolve(db.table("leads"))
         query = await _resolve(query.update(payload))
         query = await _resolve(query.eq("id", lead_id))
+        if claim_owner_id is not None:
+            query = await _resolve(query.eq("integration_claimed_by", claim_owner_id))
         query = await _resolve(query.select(LEAD_INTEGRATION_SELECT_FIELDS))
         response = await _resolve(query.execute())
     except Exception as exc:
@@ -486,6 +516,77 @@ async def update_lead_integration_status(
         raise LeadRepositoryUpdateConflict
 
     return row
+
+
+async def claim_due_leads_for_crm_sync(
+    db: AsyncClient,
+    limit: int,
+    worker_id: str,
+    claim_timeout_seconds: int,
+    max_attempts: int,
+) -> list[dict[str, Any]]:
+    """Atomically claim due CRM retries for one integration worker."""
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
+    if not worker_id.strip():
+        raise ValueError("worker_id is required")
+    if claim_timeout_seconds < 1:
+        raise ValueError("claim_timeout_seconds must be at least 1")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    try:
+        query = await _resolve(
+            db.rpc(
+                "claim_due_leads_for_crm_sync",
+                {
+                    "p_batch_limit": limit,
+                    "p_worker_id": worker_id,
+                    "p_claim_timeout_seconds": claim_timeout_seconds,
+                    "p_max_attempts": max_attempts,
+                },
+            )
+        )
+        query = await _resolve(query.select(CLAIMED_CRM_LEAD_SELECT_FIELDS))
+        response = await _resolve(query.execute())
+        rows = _rows(response)
+    except LeadRepositoryUnexpectedResult as exc:
+        raise LeadRepositoryLookupError from exc
+    except Exception as exc:
+        raise LeadRepositoryLookupError from exc
+
+    return rows
+
+
+async def count_due_leads_for_crm_sync(
+    db: AsyncClient,
+    max_attempts: int,
+    now: datetime | None = None,
+) -> int:
+    """Count currently due, non-exhausted CRM retry rows."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    due_at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+
+    try:
+        query = await _resolve(db.table("leads"))
+        query = await _resolve(query.select("id", count="exact"))
+        query = await _resolve(
+            query.eq("integration_status", LeadIntegrationStatus.FAILED.value)
+        )
+        query = await _resolve(
+            query.lte("integration_next_attempt_at", due_at)
+        )
+        query = await _resolve(
+            query.lt("integration_retry_attempt_count", max_attempts)
+        )
+        query = await _resolve(query.limit(0))
+        response = await _resolve(query.execute())
+        return _count(response)
+    except LeadRepositoryUnexpectedResult as exc:
+        raise LeadRepositoryLookupError from exc
+    except Exception as exc:
+        raise LeadRepositoryLookupError from exc
 
 
 async def claim_pending_leads(

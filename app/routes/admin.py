@@ -628,6 +628,8 @@ async def admin_dashboard() -> str:
         let queueAbortController = null;
         let leadListAbortController = null;
         let detailAbortController = null;
+        let syncAbortController = null;
+        let exportAbortController = null;
         let detailRequestId = 0;
         let refreshInFlight = null;
         let selectedLead = null;
@@ -757,10 +759,36 @@ async def admin_dashboard() -> str:
             document.getElementById("maxAttempts").textContent = "-";
         }
 
+        function cancelProtectedRequests() {
+            if (queueAbortController) {
+                queueAbortController.abort();
+                queueAbortController = null;
+            }
+            if (leadListAbortController) {
+                leadListAbortController.abort();
+                leadListAbortController = null;
+            }
+            if (detailAbortController) {
+                detailAbortController.abort();
+                detailAbortController = null;
+            }
+            if (syncAbortController) {
+                syncAbortController.abort();
+                syncAbortController = null;
+            }
+            if (exportAbortController) {
+                exportAbortController.abort();
+                exportAbortController = null;
+            }
+            leadsTableBody.removeAttribute("aria-busy");
+            setButtonBusy(exportCsvButton, false, "Exporting...");
+        }
+
         async function saveToken() {
             const token = tokenInput.value.trim();
             tokenInput.value = token;
             if (!token) {
+                cancelProtectedRequests();
                 localStorage.removeItem(TOKEN_STORAGE_KEY);
                 clearQueueMetrics();
                 leadsTableBody.innerHTML = `
@@ -1084,6 +1112,11 @@ async def admin_dashboard() -> str:
 
             setButtonBusy(syncLeadButton, true, "Syncing...");
             setDetailStatus("Syncing lead...");
+            if (syncAbortController) {
+                syncAbortController.abort();
+            }
+            const requestController = new AbortController();
+            syncAbortController = requestController;
             let outcome = null;
             let outcomeIsError = false;
             try {
@@ -1091,7 +1124,8 @@ async def admin_dashboard() -> str:
                     `/api/leads/${encodeURIComponent(leadId)}/sync`,
                     {
                         method: "POST",
-                        headers: getAuthHeaders()
+                        headers: getAuthHeaders(),
+                        signal: requestController.signal
                     }
                 );
                 const body = await readResponseBody(response);
@@ -1108,11 +1142,17 @@ async def admin_dashboard() -> str:
                     throw new Error("Lead sync returned an unexpected response.");
                 }
             } catch (error) {
+                if (error.name === "AbortError") {
+                    return;
+                }
                 if (selectedLead && String(selectedLead.id) === String(leadId)) {
                     setDetailStatus(error.message || "Lead sync failed.", true);
                 }
                 return;
             } finally {
+                if (syncAbortController === requestController) {
+                    syncAbortController = null;
+                }
                 if (selectedLead && String(selectedLead.id) === String(leadId)) {
                     setButtonBusy(syncLeadButton, false, "Syncing...");
                 }
@@ -1140,12 +1180,18 @@ async def admin_dashboard() -> str:
             }
 
             const params = buildLeadQueryParams(1000);
+            if (exportAbortController) {
+                exportAbortController.abort();
+            }
+            const requestController = new AbortController();
+            exportAbortController = requestController;
             setButtonBusy(exportCsvButton, true, "Exporting...");
             setStatus("Preparing CSV export...");
             try {
                 const response = await fetch(`/api/leads/export/csv?${params.toString()}`, {
                     headers: getAuthHeaders(),
-                    cache: "no-store"
+                    cache: "no-store",
+                    signal: requestController.signal
                 });
                 if (!response.ok) {
                     const body = await readResponseBody(response);
@@ -1163,9 +1209,15 @@ async def admin_dashboard() -> str:
                 window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 0);
                 setStatus("CSV export downloaded.");
             } catch (error) {
+                if (error.name === "AbortError") {
+                    return;
+                }
                 setStatus(error.message || "CSV export failed.", true);
             } finally {
-                setButtonBusy(exportCsvButton, false, "Exporting...");
+                if (exportAbortController === requestController) {
+                    exportAbortController = null;
+                    setButtonBusy(exportCsvButton, false, "Exporting...");
+                }
             }
         }
 

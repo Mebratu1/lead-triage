@@ -22,6 +22,11 @@ from app.models.classification import (
     LeadClassificationBatchResult,
     LeadClassificationQueueMetrics,
 )
+from app.services.alert_routing import (
+    AlertRouter,
+    WorkerAlertMonitor,
+    configured_alert_router,
+)
 from app.services.lead_classification import LeadClassificationClient
 from app.services.lead_classification_worker import (
     DEFAULT_CLAIM_TIMEOUT_SECONDS,
@@ -47,6 +52,7 @@ FetchQueueMetrics = Callable[
     [AsyncClient, int],
     Awaitable[LeadClassificationQueueMetrics],
 ]
+AlertRouterFactory = Callable[[], Awaitable[AlertRouter]]
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,11 @@ class DaemonSettings:
     retry_after_seconds: int = DEFAULT_RETRY_AFTER_SECONDS
     max_attempts: int = DEFAULT_MAX_CLASSIFICATION_ATTEMPTS
     run_once: bool = False
+    alert_stalled_queue_iterations: int = settings.alert_stalled_queue_iterations
+    alert_high_error_rate_threshold: float = settings.alert_high_error_rate_threshold
+    alert_min_error_sample_size: int = settings.alert_min_error_sample_size
+    alert_repeated_crash_count: int = settings.alert_repeated_crash_count
+    alert_cooldown_seconds: int = settings.alert_cooldown_seconds
 
 
 @dataclass(frozen=True)
@@ -226,6 +237,10 @@ async def _get_client() -> LeadClassificationClient:
     return OpenAILeadClassificationClient()
 
 
+async def _get_alert_router() -> AlertRouter:
+    return configured_alert_router()
+
+
 async def _process_batch(
     db: AsyncClient,
     client: LeadClassificationClient,
@@ -289,6 +304,8 @@ async def run_daemon(
     client_factory: Callable[[], Awaitable[LeadClassificationClient]] = _get_client,
     process_batch: ProcessBatch = _process_batch,
     fetch_queue_metrics: FetchQueueMetrics = _fetch_queue_metrics,
+    alert_router: AlertRouter | None = None,
+    alert_router_factory: AlertRouterFactory = _get_alert_router,
     sleep: Sleep = asyncio.sleep,
 ) -> DaemonRunSummary:
     """Run classification batches until shutdown or run-once completion."""
@@ -297,6 +314,16 @@ async def run_daemon(
     created_client = client is None
     active_db = db or await db_factory()
     active_client = client or await client_factory()
+    active_alert_router = alert_router or await alert_router_factory()
+    alert_monitor = WorkerAlertMonitor(
+        worker=daemon_settings.worker_id or "classification-daemon",
+        router=active_alert_router,
+        stalled_queue_iterations=daemon_settings.alert_stalled_queue_iterations,
+        high_error_rate_threshold=daemon_settings.alert_high_error_rate_threshold,
+        min_error_sample_size=daemon_settings.alert_min_error_sample_size,
+        repeated_crash_count=daemon_settings.alert_repeated_crash_count,
+        cooldown_seconds=daemon_settings.alert_cooldown_seconds,
+    )
     summary = _empty_summary()
 
     logger.info(
@@ -310,6 +337,7 @@ async def run_daemon(
 
     try:
         while not active_shutdown.requested:
+            batch_crashed = False
             try:
                 batch = await process_batch(
                     active_db,
@@ -317,6 +345,7 @@ async def run_daemon(
                     daemon_settings,
                 )
             except Exception as exc:
+                batch_crashed = True
                 logger.error(
                     "Lead classification daemon batch failed error_type=%s",
                     type(exc).__name__,
@@ -358,6 +387,15 @@ async def run_daemon(
                 queue_metrics.pending_count if queue_metrics else None,
                 queue_metrics.backoff_count if queue_metrics else None,
                 queue_metrics.exhausted_count if queue_metrics else None,
+            )
+            await alert_monitor.observe_iteration(
+                fetched=batch.fetched,
+                completed=batch.saved,
+                errors=batch.errors,
+                queue_pending=(
+                    queue_metrics.pending_count if queue_metrics else None
+                ),
+                batch_crashed=batch_crashed,
             )
 
             if daemon_settings.run_once or active_shutdown.requested:

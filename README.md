@@ -17,7 +17,8 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Queue health metrics connected
 - Admin lead read API foundation connected
 - Browser admin dashboard interactions and richer lead detail views connected
-- CRM sync tracking and filtered CSV export connected
+- Signed CRM webhook delivery, concurrent retry processing, and filtered CSV export
+- Signed worker alert routing for stalled queues, high error rates, and repeated batch crashes
 
 ## Runtime
 
@@ -29,7 +30,7 @@ The repository includes `.python-version` with:
 3.12
 ```
 
-The current workstation may temporarily run tests with Python 3.14.3 until Python 3.12 is installed. Do not claim full Python 3.12 verification until the suite passes under Python 3.12.
+The repository is verified with Python 3.12.10.
 
 ## API
 
@@ -161,7 +162,16 @@ Read responses intentionally expose only the admin-safe fields needed for review
 
 `GET /api/leads/export/csv` accepts the same filters as the lead list endpoint plus bounded `limit` and `offset` controls. It streams `classified_leads_export.csv` with only `ID`, `Source`, `Customer Name`, `Customer Email`, `Customer Phone`, `Status`, `Urgency`, `Summary`, and `Created At`. Exported cells are escaped when they look like spreadsheet formulas.
 
-`POST /api/leads/{id}/sync` records outbound CRM sync tracking for classified leads only. The current dispatcher is a safe adapter boundary with no vendor-specific network call yet; failures are stored as sanitized integration reasons with a retry timestamp, not raw exception text.
+`POST /api/leads/{id}/sync` sends classified leads to the configured HTTPS CRM webhook. The endpoint fails closed with `503` and does not mutate integration state when `CRM_WEBHOOK_URL` or `CRM_WEBHOOK_SECRET` is absent. Successful `2xx` responses mark the lead synced. HTTP `429`, HTTP `5xx`, and transport timeouts schedule a retry; other non-`2xx` responses remain failed without a retry timestamp. Stored and returned errors are sanitized and never contain the destination response body.
+
+CRM requests use canonical JSON and these headers:
+
+- `X-LeadTriage-Event: lead.sync`
+- `X-LeadTriage-Timestamp: <unix-seconds>`
+- `X-LeadTriage-Signature: sha256=<HMAC-SHA256>`
+- `Idempotency-Key: <lead-id>`
+
+The signature input is the UTF-8 byte sequence `<timestamp>.<raw-request-body>`. Receivers should reject stale timestamps, compare signatures with a constant-time function, and deduplicate on the lead-ID idempotency key.
 
 ### Browser Admin Dashboard
 
@@ -169,7 +179,7 @@ Read responses intentionally expose only the admin-safe fields needed for review
 GET /admin
 ```
 
-The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to store it in browser `localStorage` and load queue metrics plus protected lead data from the existing endpoints. The lead table opens a full admin-safe detail view, classified leads can be deliberately synced through the existing CRM boundary, and CSV exports reuse the active status and urgency filters.
+The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to store it in browser `localStorage` and load queue metrics plus protected lead data from the existing endpoints. The lead table opens a full admin-safe detail view, classified leads can be deliberately synced through the existing CRM boundary, and CSV exports reuse the active status and urgency filters. Clearing the token immediately aborts active protected queue, list, detail, sync, and CSV requests before clearing rendered data.
 
 The page uses:
 
@@ -206,6 +216,7 @@ Apply migrations in order:
 4. `app/db/migrations/004_classification_tracking_columns.sql` adds classified output, error, timestamp, and model tracking columns.
 5. `app/db/migrations/005_classification_claim_retry.sql` adds worker claim ownership, attempt counts, retry backoff, indexes, and the atomic claim RPC.
 6. `app/db/migrations/006_integration_sync_tracking.sql` adds outbound CRM sync status, last sync timestamp, sanitized error, retry timestamp, constraints, and indexes.
+7. `app/db/migrations/007_crm_retry_claiming.sql` adds CRM retry attempt and claim ownership fields, a due-retry index, and the atomic `claim_due_leads_for_crm_sync` RPC.
 
 - `id`
 - `idempotency_key`
@@ -232,6 +243,9 @@ Apply migrations in order:
 - `integration_last_synced_at`
 - `integration_error`
 - `integration_next_attempt_at`
+- `integration_retry_attempt_count`
+- `integration_claimed_at`
+- `integration_claimed_by`
 - `created_at`
 
 The request field `message` is stored as `raw_message`.
@@ -302,6 +316,40 @@ Run the long-lived daemon:
 
 The daemon handles `SIGINT` and `SIGTERM` gracefully: an active batch is allowed to finish before the process exits. Standard logs include counts, worker IDs, model names, retry/backoff events, and error types, but never full raw customer messages.
 
+## CRM Retry Jobs
+
+The CRM retry daemon atomically claims classified leads whose `integration_next_attempt_at` is due. `FOR UPDATE SKIP LOCKED`, claim ownership, and stale-claim recovery prevent two workers from owning the same database item. The external receiver must still honor `Idempotency-Key` because a network response can be lost after the receiver commits.
+
+Run one retry iteration:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.crm_sync_daemon --run-once --worker-id crm-local-1
+```
+
+Run the long-lived retry consumer:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.crm_sync_daemon --limit 10 --sleep-seconds 30 --worker-id crm-local-1
+```
+
+The initial retry delay is `CRM_RETRY_BASE_SECONDS`. Each failed worker retry for HTTP `429`, HTTP `5xx`, or a transport failure doubles the delay up to `CRM_RETRY_MAX_SECONDS`. After `CRM_RETRY_MAX_ATTEMPTS`, the lead remains failed with no next-attempt timestamp. Non-`429` HTTP `4xx` responses are not automatically retried.
+
+Migration `007` must be applied before running this daemon or using sync updates from this version. No Docker, hosting-provider, or deployed worker orchestration was added or verified by this milestone; the existing Compose file still launches only the API and classification worker.
+
+## Worker Alert Routing
+
+When `ALERT_WEBHOOK_URL` and a distinct `ALERT_WEBHOOK_SECRET` are configured, both worker daemons emit canonical signed JSON alerts using the same timestamp and HMAC header contract as CRM delivery. Alert incidents use cooldown-bucket idempotency keys and contain aggregate operational counts only.
+
+The classification daemon routes:
+
+- `worker.queue_stalled` after `ALERT_STALLED_QUEUE_ITERATIONS` with pending work and no completed items
+- `worker.high_error_rate` when the batch meets `ALERT_MIN_ERROR_SAMPLE_SIZE` and `ALERT_HIGH_ERROR_RATE_THRESHOLD`
+- `worker.repeated_crashes` after `ALERT_REPEATED_CRASH_COUNT` consecutive uncaught batch-execution failures
+
+The CRM retry daemon routes stalled due-retry backlog, high-error-rate, and repeated-batch-crash incidents. Alert delivery failures are sanitized and do not stop lead processing. When alert webhook settings are absent, the same threshold events are logged as not externally delivered.
+
+Repeated-crash counting is process-local and covers batch exceptions recovered by the daemon loop. Detecting hard process termination or correlating crashes across restarts still requires an external process supervisor or persistent incident store.
+
 ## Docker
 
 The Docker image uses Python 3.12 to match the project runtime constraint in `pyproject.toml`. The same application image is used for both services. `docker-compose.yml` starts:
@@ -355,6 +403,8 @@ Production startup intentionally fails fast for unsafe configuration. When `ENVI
 - wildcard, localhost, or `127.0.0.1` CORS origins
 - placeholder or short `JWT_SECRET` values
 - blank required service credentials
+- partial CRM or alert webhook configuration
+- non-HTTPS webhook URLs, short webhook secrets, or reused CRM/alert signing secrets
 
 ### Production Environment Validation
 
@@ -385,6 +435,21 @@ Required production environment variables:
 | `REQUEST_MAX_BYTES` | request body limit, default `32768` |
 | `DEDUP_WINDOW_DAYS` | idempotency bucket window, default `7` |
 
+Feature-gated worker variables:
+
+| Variable | Expectation |
+| --- | --- |
+| `CRM_WEBHOOK_URL` | absolute HTTPS lead webhook; sync fails closed when absent |
+| `CRM_WEBHOOK_SECRET` | CRM-only HMAC secret with at least 32 characters |
+| `CRM_WEBHOOK_TIMEOUT_SECONDS` | strict connect/read/write/pool timeout, default `5` |
+| `CRM_RETRY_BASE_SECONDS` | initial scheduled delay, default `60` |
+| `CRM_RETRY_MAX_SECONDS` | exponential-backoff cap, default `3600` |
+| `CRM_RETRY_MAX_ATTEMPTS` | worker retry limit, default `5` |
+| `ALERT_WEBHOOK_URL` | absolute HTTPS worker incident webhook |
+| `ALERT_WEBHOOK_SECRET` | alert-only HMAC secret with at least 32 characters |
+| `ALERT_HIGH_ERROR_RATE_THRESHOLD` | error-rate trigger, default `0.5` |
+| `ALERT_REPEATED_CRASH_COUNT` | consecutive batch-crash trigger, default `3` |
+
 Example production values, with fake secret placeholders:
 
 ```env
@@ -406,7 +471,7 @@ DEDUP_WINDOW_DAYS=7
 
 ### Production Database Constraints
 
-Before deploying API or worker containers, apply Supabase migrations `001` through `006` in order and verify these database safeguards exist:
+Before deploying API or worker containers, apply Supabase migrations `001` through `007` in order and verify these database safeguards exist:
 
 - `raw_message`, `source`, `classification_status`, `idempotency_key`, and `deduplication_bucket` support intake persistence.
 - The unique index on `(idempotency_key, deduplication_bucket)` prevents duplicate lead inserts inside the configured deduplication bucket.
@@ -415,6 +480,8 @@ Before deploying API or worker containers, apply Supabase migrations `001` throu
 - Worker claim columns exist: `classification_claimed_at`, `classification_claimed_by`, `classification_attempt_count`, `last_classification_error`, and `next_classification_attempt_at`.
 - The `claim_pending_leads_for_classification` RPC exists and is executable by the server-side role used by the backend.
 - Integration sync columns exist: `integration_status`, `integration_last_synced_at`, `integration_error`, and `integration_next_attempt_at`.
+- Integration retry claim columns and `integration_retry_attempt_count >= 0` exist.
+- The `claim_due_leads_for_crm_sync` RPC exists and is executable by the server-side role.
 
 Live database verification:
 
@@ -537,7 +604,7 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 
 ### Deployment Checklist
 
-1. Apply Supabase migrations `001` through `006` in order.
+1. Apply Supabase migrations `001` through `007` in order.
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Confirm `OPENAI_API_KEY` is available only to server containers.
 4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
@@ -588,6 +655,6 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Vendor-specific CRM adapter or webhook delivery from the sync boundary
-2. Alert routing for queue metrics and repeated worker failures
-3. Deployment automation with provider-specific infrastructure files
+1. Provider-specific CRM field mapping beyond the generic signed webhook contract
+2. Persistent incident state or external supervision for crash detection across process restarts
+3. Deployment automation and runtime orchestration for the CRM retry daemon

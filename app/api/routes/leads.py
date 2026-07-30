@@ -29,7 +29,12 @@ from app.repositories.lead_repository import (
     list_leads,
     update_lead_integration_status,
 )
-from app.services.crm_sync import dispatch_lead_to_crm
+from app.services.crm_sync import (
+    CrmConfigurationError,
+    CrmDeliveryPermanentError,
+    CrmDeliveryRetryableError,
+    dispatch_lead_to_crm,
+)
 from app.services.lead_persistence import (
     LeadInsertFailed,
     LeadLookupFailed,
@@ -62,7 +67,6 @@ CSV_EXPORT_HEADERS = [
     "Summary",
     "Created At",
 ]
-CRM_SYNC_RETRY_AFTER_SECONDS = 300
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
@@ -118,6 +122,32 @@ def _sync_response_from_row(
         retry_after_seconds=retry_after_seconds,
         detail=detail,
     )
+
+
+async def _record_sync_failure(
+    *,
+    db: AsyncClient,
+    lead_id: UUID,
+    error_reason: str,
+    retry_after_seconds: int | None,
+) -> dict:
+    """Store sanitized integration failure state or return a safe service error."""
+    try:
+        return await update_lead_integration_status(
+            db=db,
+            lead_id=str(lead_id),
+            integration_status=LeadIntegrationStatus.FAILED,
+            error_reason=error_reason,
+            retry_after_seconds=retry_after_seconds,
+            now=datetime.now(UTC),
+            reset_retry_attempts=True,
+        )
+    except (LeadRepositoryUpdateConflict, LeadRepositoryUpdateError) as exc:
+        logger.warning("Lead sync failure tracking update failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Lead sync failed",
+        ) from exc
 
 
 def _utc_datetime(value: datetime) -> datetime:
@@ -363,34 +393,71 @@ async def sync_lead_to_crm(
 
     try:
         await dispatch_lead_to_crm(lead)
-    except Exception as exc:
+    except CrmConfigurationError as exc:
         logger.warning(
-            "Lead CRM sync dispatch failed lead_id=%s retry_after_seconds=%s error_type=%s",
+            "Lead CRM sync rejected because integration is not configured lead_id=%s",
             lead_id,
-            CRM_SYNC_RETRY_AFTER_SECONDS,
-            exc.__class__.__name__,
         )
-        try:
-            failed_row = await update_lead_integration_status(
-                db=db,
-                lead_id=str(lead_id),
-                integration_status=LeadIntegrationStatus.FAILED,
-                error_reason="crm_dispatch_failed",
-                retry_after_seconds=CRM_SYNC_RETRY_AFTER_SECONDS,
-                now=datetime.now(UTC),
-            )
-        except (LeadRepositoryUpdateConflict, LeadRepositoryUpdateError) as update_exc:
-            logger.warning("Lead sync failure tracking update failed")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Lead sync failed",
-            ) from update_exc
-
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="CRM integration is not configured",
+        ) from exc
+    except CrmDeliveryRetryableError as exc:
+        retry_after_seconds = settings.crm_retry_base_seconds
+        logger.warning(
+            "Lead CRM sync received retryable failure lead_id=%s "
+            "retry_after_seconds=%s status_code=%s",
+            lead_id,
+            retry_after_seconds,
+            exc.status_code,
+        )
+        failed_row = await _record_sync_failure(
+            db=db,
+            lead_id=lead_id,
+            error_reason="crm_retryable_failure",
+            retry_after_seconds=retry_after_seconds,
+        )
         response.status_code = status.HTTP_502_BAD_GATEWAY
         return _sync_response_from_row(
             failed_row,
             detail="CRM sync failed; retry scheduled",
-            retry_after_seconds=CRM_SYNC_RETRY_AFTER_SECONDS,
+            retry_after_seconds=retry_after_seconds,
+        )
+    except CrmDeliveryPermanentError as exc:
+        logger.warning(
+            "Lead CRM sync received permanent failure lead_id=%s status_code=%s",
+            lead_id,
+            exc.status_code,
+        )
+        failed_row = await _record_sync_failure(
+            db=db,
+            lead_id=lead_id,
+            error_reason="crm_permanent_failure",
+            retry_after_seconds=None,
+        )
+        response.status_code = status.HTTP_502_BAD_GATEWAY
+        return _sync_response_from_row(
+            failed_row,
+            detail="CRM sync rejected; manual intervention required",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Lead CRM sync dispatch failed lead_id=%s retry_state=manual error_type=%s",
+            lead_id,
+            exc.__class__.__name__,
+        )
+        failed_row = await _record_sync_failure(
+            db=db,
+            lead_id=lead_id,
+            error_reason="crm_dispatch_failed",
+            retry_after_seconds=None,
+        )
+
+        response.status_code = status.HTTP_502_BAD_GATEWAY
+        return _sync_response_from_row(
+            failed_row,
+            detail="CRM sync failed; manual retry required",
+            retry_after_seconds=None,
         )
 
     try:
@@ -399,6 +466,7 @@ async def sync_lead_to_crm(
             lead_id=str(lead_id),
             integration_status=LeadIntegrationStatus.SYNCED,
             synced_at=datetime.now(UTC),
+            reset_retry_attempts=True,
         )
     except LeadRepositoryUpdateConflict as exc:
         raise HTTPException(
