@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 
 from app.models.lead import LeadIntegrationStatus
+from app.models.integration import CrmRetryState
 
 
 class HealthCheckResponse(BaseModel):
@@ -52,6 +53,9 @@ class LeadPublicResponse(BaseModel):
     classification_attempt_count: int
     integration_status: LeadIntegrationStatus
     integration_last_synced_at: datetime | None
+    integration_retry_state: CrmRetryState | None = None
+    integration_next_attempt_at: datetime | None = None
+    integration_retry_attempt_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -75,5 +79,8 @@ class LeadSyncResponse(BaseModel):
     id: UUID
     integration_status: LeadIntegrationStatus
     integration_last_synced_at: datetime | None
+    integration_retry_state: CrmRetryState | None = None
+    integration_next_attempt_at: datetime | None = None
+    integration_retry_attempt_count: int = 0
     retry_after_seconds: int | None = None
     detail: str

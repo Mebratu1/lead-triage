@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 ADMIN_TOKEN = "admin-token-with-enough-length"
+QUEUE_TOKEN = "queue-token-with-enough-length"
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -219,7 +220,7 @@ def get_with_db(
 @pytest.fixture(autouse=True)
 def admin_token(monkeypatch):
     """Configure the admin token for all read API tests."""
-    monkeypatch.setattr("app.api.routes.leads.settings.queue_metrics_token", ADMIN_TOKEN)
+    monkeypatch.setattr("app.api.routes.leads.settings.admin_token", ADMIN_TOKEN)
 
 
 class TestLeadReadApi:
@@ -314,6 +315,9 @@ class TestLeadReadApi:
             "classification_attempt_count",
             "integration_status",
             "integration_last_synced_at",
+            "integration_retry_state",
+            "integration_next_attempt_at",
+            "integration_retry_attempt_count",
             "created_at",
             "updated_at",
         }
@@ -322,6 +326,9 @@ class TestLeadReadApi:
         assert body["message"] == "Hi, I need emergency plumbing today."
         assert body["integration_status"] == "pending"
         assert body["integration_last_synced_at"] is None
+        assert body["integration_retry_state"] is None
+        assert body["integration_next_attempt_at"] is None
+        assert body["integration_retry_attempt_count"] == 0
         assert body["updated_at"] == "2026-07-30T12:30:00Z"
         assert "idempotency_key" not in response.text
         assert "deduplication_bucket" not in response.text
@@ -376,19 +383,83 @@ class TestLeadReadApi:
         assert response.json() == {"detail": "Admin access required"}
 
     @pytest.mark.unit
+    def test_read_endpoints_reject_queue_metrics_token(
+        self,
+        client: TestClient,
+        monkeypatch,
+    ):
+        """Test the monitoring credential cannot authorize admin data access."""
+        monkeypatch.setattr(
+            "app.api.routes.leads.settings.queue_metrics_token",
+            QUEUE_TOKEN,
+        )
+        database = FakeLeadReadDatabase(rows=read_rows())
+
+        response = get_with_db(
+            client,
+            database,
+            "/api/leads",
+            headers={"X-Admin-Token": QUEUE_TOKEN},
+        )
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Admin access required"}
+
+    @pytest.mark.unit
     def test_read_endpoints_reject_access_when_admin_token_unconfigured(
         self,
         client: TestClient,
         monkeypatch,
     ):
         """Test read endpoints stay closed if the admin token is not configured."""
-        monkeypatch.setattr("app.api.routes.leads.settings.queue_metrics_token", None)
+        monkeypatch.setattr("app.api.routes.leads.settings.admin_token", None)
         database = FakeLeadReadDatabase(rows=read_rows())
 
         response = get_with_db(client, database, "/api/leads")
 
         assert response.status_code == 403
         assert response.json() == {"detail": "Admin access required"}
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("next_attempt_at", "error_reason", "expected_state"),
+        [
+            ("2026-07-30T13:00:00+00:00", "crm_retryable_failure", "scheduled"),
+            (None, "crm_permanent_failure", "manual"),
+            (None, "crm_retry_exhausted", "exhausted"),
+        ],
+    )
+    def test_detail_exposes_safe_crm_retry_state(
+        self,
+        client: TestClient,
+        next_attempt_at: str | None,
+        error_reason: str,
+        expected_state: str,
+    ):
+        """Test retry visibility never exposes the stored internal error code."""
+        rows = read_rows()
+        rows[0].update(
+            integration_status="failed",
+            integration_error=error_reason,
+            integration_next_attempt_at=next_attempt_at,
+            integration_retry_attempt_count=3,
+        )
+        database = FakeLeadReadDatabase(rows=rows)
+
+        response = get_with_db(
+            client,
+            database,
+            "/api/leads/11111111-1111-4111-8111-111111111111",
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["integration_retry_state"] == expected_state
+        assert body["integration_next_attempt_at"] == (
+            "2026-07-30T13:00:00Z" if next_attempt_at else None
+        )
+        assert body["integration_retry_attempt_count"] == 3
+        assert error_reason not in response.text
 
     @pytest.mark.unit
     def test_list_leads_database_failure_is_safe(self, client: TestClient):

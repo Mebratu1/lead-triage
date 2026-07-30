@@ -483,6 +483,7 @@ async def admin_dashboard() -> str:
             }
 
             #adminToken,
+            #queueToken,
             button,
             select {
                 width: 100%;
@@ -522,6 +523,7 @@ async def admin_dashboard() -> str:
             </div>
             <div class="controls">
                 <input id="adminToken" type="password" autocomplete="off" aria-label="Admin token" placeholder="Admin token">
+                <input id="queueToken" type="password" autocomplete="off" aria-label="Queue metrics token" placeholder="Queue metrics token">
                 <button id="saveTokenButton" type="button" class="button-primary">Save</button>
                 <button id="refreshButton" type="button" class="button-secondary">Refresh</button>
             </div>
@@ -608,9 +610,11 @@ async def admin_dashboard() -> str:
     </main>
 
     <script>
-        const TOKEN_STORAGE_KEY = "lead_triage_admin_token";
+        const ADMIN_TOKEN_STORAGE_KEY = "lead_triage_admin_token";
+        const QUEUE_TOKEN_STORAGE_KEY = "lead_triage_queue_metrics_token";
         const REFRESH_INTERVAL_MS = 30000;
-        const tokenInput = document.getElementById("adminToken");
+        const adminTokenInput = document.getElementById("adminToken");
+        const queueTokenInput = document.getElementById("queueToken");
         const saveTokenButton = document.getElementById("saveTokenButton");
         const refreshButton = document.getElementById("refreshButton");
         const exportCsvButton = document.getElementById("exportCsvButton");
@@ -634,13 +638,22 @@ async def admin_dashboard() -> str:
         let refreshInFlight = null;
         let selectedLead = null;
 
-        function getToken() {
-            return localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+        function getAdminToken() {
+            return localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || "";
         }
 
-        function getAuthHeaders() {
-            const token = getToken();
+        function getQueueToken() {
+            return localStorage.getItem(QUEUE_TOKEN_STORAGE_KEY) || "";
+        }
+
+        function getAdminAuthHeaders() {
+            const token = getAdminToken();
             return token ? { "X-Admin-Token": token } : {};
+        }
+
+        function getQueueAuthHeaders() {
+            const token = getQueueToken();
+            return token ? { Authorization: `Bearer ${token}` } : {};
         }
 
         function setStatus(message, isError = false) {
@@ -729,12 +742,12 @@ async def admin_dashboard() -> str:
             return body && typeof body.detail === "string" ? body.detail : fallback;
         }
 
-        function requireToken(reportError) {
-            if (getToken()) {
+        function requireAdminToken(reportError) {
+            if (getAdminToken()) {
                 return true;
             }
             reportError("Save an admin token before using this action.", true);
-            tokenInput.focus();
+            adminTokenInput.focus();
             return false;
         }
 
@@ -759,11 +772,14 @@ async def admin_dashboard() -> str:
             document.getElementById("maxAttempts").textContent = "-";
         }
 
-        function cancelProtectedRequests() {
+        function cancelQueueRequest() {
             if (queueAbortController) {
                 queueAbortController.abort();
                 queueAbortController = null;
             }
+        }
+
+        function cancelAdminRequests() {
             if (leadListAbortController) {
                 leadListAbortController.abort();
                 leadListAbortController = null;
@@ -784,25 +800,66 @@ async def admin_dashboard() -> str:
             setButtonBusy(exportCsvButton, false, "Exporting...");
         }
 
+        function cancelProtectedRequests() {
+            cancelQueueRequest();
+            cancelAdminRequests();
+        }
+
+        function showEmptyLeadDetail() {
+            leadDetailTitle.textContent = "Lead details";
+            leadDetailContent.removeAttribute("aria-busy");
+            leadDetailContent.innerHTML = (
+                '<p class="detail-loading">Select a lead to view details.</p>'
+            );
+            setDetailStatus("");
+        }
+
         async function saveToken() {
-            const token = tokenInput.value.trim();
-            tokenInput.value = token;
-            if (!token) {
+            const adminToken = adminTokenInput.value.trim();
+            const queueToken = queueTokenInput.value.trim();
+            const adminTokenChanged = adminToken !== getAdminToken();
+            const queueTokenChanged = queueToken !== getQueueToken();
+            adminTokenInput.value = adminToken;
+            queueTokenInput.value = queueToken;
+            if (adminTokenChanged && queueTokenChanged) {
                 cancelProtectedRequests();
-                localStorage.removeItem(TOKEN_STORAGE_KEY);
-                clearQueueMetrics();
+            } else if (adminTokenChanged) {
+                cancelAdminRequests();
+            } else if (queueTokenChanged) {
+                cancelQueueRequest();
+            }
+            if (adminTokenChanged) {
+                resetLeadDetailState();
+            }
+
+            if (adminToken) {
+                localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, adminToken);
+            } else {
+                localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
                 leadsTableBody.innerHTML = `
                     <tr>
                         <td colspan="6" class="empty">Save an admin token to load leads.</td>
                     </tr>
                 `;
-                setStatus("Admin token cleared.");
                 closeLeadDetail();
-                return;
             }
 
-            localStorage.setItem(TOKEN_STORAGE_KEY, token);
-            setStatus("Admin token saved. Refreshing data...");
+            if (queueToken) {
+                localStorage.setItem(QUEUE_TOKEN_STORAGE_KEY, queueToken);
+            } else {
+                localStorage.removeItem(QUEUE_TOKEN_STORAGE_KEY);
+                clearQueueMetrics();
+            }
+
+            if (!adminToken && !queueToken) {
+                setStatus("Admin and queue tokens cleared.");
+            } else if (!adminToken) {
+                setStatus("Queue token saved; admin data cleared.");
+            } else if (!queueToken) {
+                setStatus("Admin token saved; queue metrics cleared.");
+            } else {
+                setStatus("Tokens saved. Refreshing data...");
+            }
             await refreshData(true);
         }
 
@@ -825,6 +882,10 @@ async def admin_dashboard() -> str:
         }
 
         async function loadQueueMetrics() {
+            if (!getQueueToken()) {
+                clearQueueMetrics();
+                return;
+            }
             if (queueAbortController) {
                 queueAbortController.abort();
             }
@@ -832,7 +893,7 @@ async def admin_dashboard() -> str:
             queueAbortController = requestController;
             try {
                 const response = await fetch("/health/queue", {
-                    headers: getAuthHeaders(),
+                    headers: getQueueAuthHeaders(),
                     cache: "no-store",
                     signal: requestController.signal
                 });
@@ -859,6 +920,14 @@ async def admin_dashboard() -> str:
         }
 
         async function loadLeads() {
+            if (!getAdminToken()) {
+                leadsTableBody.innerHTML = `
+                    <tr>
+                        <td colspan="6" class="empty">Save an admin token to load leads.</td>
+                    </tr>
+                `;
+                return;
+            }
             if (leadListAbortController) {
                 leadListAbortController.abort();
             }
@@ -869,7 +938,7 @@ async def admin_dashboard() -> str:
             setStatus("Loading leads...");
             try {
                 const response = await fetch(`/api/leads?${params.toString()}`, {
-                    headers: getAuthHeaders(),
+                    headers: getAdminAuthHeaders(),
                     cache: "no-store",
                     signal: requestController.signal
                 });
@@ -995,6 +1064,18 @@ async def admin_dashboard() -> str:
                         <div class="detail-value">${escapeHtml(formatDate(lead.integration_last_synced_at))}</div>
                     </div>
                     <div class="detail-field">
+                        <div class="detail-label">CRM retry state</div>
+                        <div class="detail-value">${escapeHtml(lead.integration_retry_state || "N/A")}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">Next CRM attempt</div>
+                        <div class="detail-value">${escapeHtml(formatDate(lead.integration_next_attempt_at))}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-label">CRM retry attempts</div>
+                        <div class="detail-value">${escapeHtml(lead.integration_retry_attempt_count ?? 0)}</div>
+                    </div>
+                    <div class="detail-field">
                         <div class="detail-label">Lead ID</div>
                         <div class="detail-value">${escapeHtml(lead.id)}</div>
                     </div>
@@ -1021,7 +1102,7 @@ async def admin_dashboard() -> str:
         }
 
         async function loadLeadDetail(leadId) {
-            if (!requireToken(setDetailStatus)) {
+            if (!requireAdminToken(setDetailStatus)) {
                 return;
             }
             if (detailAbortController) {
@@ -1043,7 +1124,7 @@ async def admin_dashboard() -> str:
 
             try {
                 const response = await fetch(`/api/leads/${encodeURIComponent(leadId)}`, {
-                    headers: getAuthHeaders(),
+                    headers: getAdminAuthHeaders(),
                     cache: "no-store",
                     signal: requestController.signal
                 });
@@ -1061,7 +1142,13 @@ async def admin_dashboard() -> str:
                 selectedLead = body;
                 renderLeadDetail(body);
             } catch (error) {
-                if (error.name === "AbortError" || requestId !== detailRequestId) {
+                if (error.name === "AbortError") {
+                    if (requestId === detailRequestId) {
+                        showEmptyLeadDetail();
+                    }
+                    return;
+                }
+                if (requestId !== detailRequestId) {
                     return;
                 }
                 leadDetailContent.removeAttribute("aria-busy");
@@ -1084,6 +1171,7 @@ async def admin_dashboard() -> str:
             syncLeadButton.disabled = true;
             syncLeadButton.textContent = "Sync to CRM";
             delete syncLeadButton.dataset.idleLabel;
+            showEmptyLeadDetail();
         }
 
         function closeLeadDetail() {
@@ -1098,7 +1186,7 @@ async def admin_dashboard() -> str:
                 setDetailStatus("Only classified leads can be synced.", true);
                 return;
             }
-            if (!requireToken(setDetailStatus)) {
+            if (!requireAdminToken(setDetailStatus)) {
                 return;
             }
 
@@ -1124,7 +1212,7 @@ async def admin_dashboard() -> str:
                     `/api/leads/${encodeURIComponent(leadId)}/sync`,
                     {
                         method: "POST",
-                        headers: getAuthHeaders(),
+                        headers: getAdminAuthHeaders(),
                         signal: requestController.signal
                     }
                 );
@@ -1164,7 +1252,10 @@ async def admin_dashboard() -> str:
             selectedLead = {
                 ...selectedLead,
                 integration_status: outcome.integration_status,
-                integration_last_synced_at: outcome.integration_last_synced_at
+                integration_last_synced_at: outcome.integration_last_synced_at,
+                integration_retry_state: outcome.integration_retry_state,
+                integration_next_attempt_at: outcome.integration_next_attempt_at,
+                integration_retry_attempt_count: outcome.integration_retry_attempt_count
             };
             renderLeadDetail(selectedLead);
             setDetailStatus(
@@ -1175,7 +1266,7 @@ async def admin_dashboard() -> str:
         }
 
         async function exportCsv() {
-            if (!requireToken(setStatus)) {
+            if (!requireAdminToken(setStatus)) {
                 return;
             }
 
@@ -1189,7 +1280,7 @@ async def admin_dashboard() -> str:
             setStatus("Preparing CSV export...");
             try {
                 const response = await fetch(`/api/leads/export/csv?${params.toString()}`, {
-                    headers: getAuthHeaders(),
+                    headers: getAdminAuthHeaders(),
                     cache: "no-store",
                     signal: requestController.signal
                 });
@@ -1239,7 +1330,8 @@ async def admin_dashboard() -> str:
         leadDetailDialog.addEventListener("close", resetLeadDetailState);
 
         window.addEventListener("load", () => {
-            tokenInput.value = getToken();
+            adminTokenInput.value = getAdminToken();
+            queueTokenInput.value = getQueueToken();
             refreshData();
             window.setInterval(refreshData, REFRESH_INTERVAL_MS);
         });

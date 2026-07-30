@@ -12,6 +12,7 @@ services:
       - 0.0.0.0
       - --port
       - "8000"
+      - --no-proxy-headers
     env_file:
       - .env
     ports:
@@ -43,4 +44,21 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    stop_grace_period: 2m
+
+  crm-sync-worker:
+    image: lead-triage:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command:
+      - python
+      - -m
+      - app.jobs.crm_sync_daemon
+      - --worker-id
+      - docker-crm-sync-worker-1
+    env_file:
+      - .env
+    restart: always
     stop_grace_period: 2m

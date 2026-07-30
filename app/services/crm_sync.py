@@ -64,6 +64,9 @@ class SignedWebhookCrmDispatcher:
                 exclude={
                     "integration_status",
                     "integration_last_synced_at",
+                    "integration_retry_state",
+                    "integration_next_attempt_at",
+                    "integration_retry_attempt_count",
                 },
             ),
         }

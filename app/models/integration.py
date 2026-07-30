@@ -2,6 +2,11 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
+
+from app.models.lead import LeadIntegrationStatus
+
+CrmRetryState = Literal["scheduled", "manual", "exhausted"]
 
 
 class CrmSyncOutcome(StrEnum):
@@ -37,3 +42,19 @@ class CrmSyncBatchResult:
     skipped: int
     errors: int
     results: list[CrmSyncWorkItemResult]
+
+
+def crm_retry_state(
+    *,
+    integration_status: LeadIntegrationStatus | str,
+    next_attempt_at: object | None,
+    error_reason: str | None,
+) -> CrmRetryState | None:
+    """Derive a safe retry state without exposing internal error details."""
+    if integration_status != LeadIntegrationStatus.FAILED:
+        return None
+    if next_attempt_at is not None:
+        return "scheduled"
+    if error_reason == "crm_retry_exhausted":
+        return "exhausted"
+    return "manual"

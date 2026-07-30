@@ -71,6 +71,21 @@ class TestRuntimeSettings:
 
     @pytest.mark.unit
     @pytest.mark.parametrize("token", ["", "   "])
+    def test_blank_admin_token_is_treated_as_unconfigured(self, token):
+        """Test local development can leave ADMIN_TOKEN blank."""
+        settings = build_settings(admin_token=token)
+
+        assert settings.admin_token is None
+
+    @pytest.mark.unit
+    def test_admin_token_is_trimmed(self):
+        """Test configured admin token is normalized before use."""
+        settings = build_settings(admin_token="  admin-token  ")
+
+        assert settings.admin_token == "admin-token"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("token", ["", "   "])
     def test_blank_queue_metrics_token_is_treated_as_unconfigured(self, token):
         """Test local development can leave QUEUE_METRICS_TOKEN blank."""
         settings = build_settings(queue_metrics_token=token)
@@ -83,6 +98,37 @@ class TestRuntimeSettings:
         settings = build_settings(queue_metrics_token="  monitor-token  ")
 
         assert settings.queue_metrics_token == "monitor-token"
+
+    @pytest.mark.unit
+    def test_admin_and_queue_tokens_must_be_distinct(self):
+        """Test admin and monitoring credentials cannot be reused."""
+        with pytest.raises(ValidationError, match="must be distinct"):
+            build_settings(
+                admin_token="shared-token",
+                queue_metrics_token="shared-token",
+            )
+
+    @pytest.mark.unit
+    def test_trusted_proxy_cidrs_are_normalized(self):
+        """Test trusted proxy configuration stores canonical networks."""
+        settings = build_settings(
+            trusted_proxy_cidrs=["10.1.2.3/8", "2001:db8::1/64"]
+        )
+
+        assert settings.trusted_proxy_cidrs == [
+            "10.0.0.0/8",
+            "2001:db8::/64",
+        ]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("network", ["", "not-a-network", "10.0.0.1/99"])
+    def test_trusted_proxy_cidrs_reject_invalid_networks(self, network):
+        """Test malformed trust boundaries fail during configuration."""
+        with pytest.raises(
+            ValidationError,
+            match="must contain valid IP networks",
+        ):
+            build_settings(trusted_proxy_cidrs=[network])
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -160,6 +206,7 @@ class TestProductionSettings:
             debug=False,
             allowed_origins=["https://app.example.com"],
             jwt_secret="production-secret-value-with-enough-entropy",
+            admin_token="admin-token-with-enough-entropy",
             queue_metrics_token="queue-metrics-token-with-enough-entropy",
         )
 
@@ -175,6 +222,7 @@ class TestProductionSettings:
                 debug=True,
                 allowed_origins=["https://app.example.com"],
                 jwt_secret="production-secret-value-with-enough-entropy",
+                admin_token="admin-token-with-enough-entropy",
                 queue_metrics_token="queue-metrics-token-with-enough-entropy",
             )
 
@@ -198,6 +246,7 @@ class TestProductionSettings:
                 environment="production",
                 allowed_origins=[origin],
                 jwt_secret="production-secret-value-with-enough-entropy",
+                admin_token="admin-token-with-enough-entropy",
                 queue_metrics_token="queue-metrics-token-with-enough-entropy",
             )
 
@@ -236,5 +285,22 @@ class TestProductionSettings:
                 environment="production",
                 allowed_origins=["https://app.example.com"],
                 jwt_secret="production-secret-value-with-enough-entropy",
+                admin_token="admin-token-with-enough-entropy",
                 queue_metrics_token=token,
+            )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("token", [None, "", "short-token"])
+    def test_production_requires_admin_token(self, token):
+        """Test production admin routes require a strong distinct credential."""
+        with pytest.raises(
+            ValidationError,
+            match="ADMIN_TOKEN must be configured",
+        ):
+            build_settings(
+                environment="production",
+                allowed_origins=["https://app.example.com"],
+                jwt_secret="production-secret-value-with-enough-entropy",
+                admin_token=token,
+                queue_metrics_token="queue-metrics-token-with-enough-entropy",
             )

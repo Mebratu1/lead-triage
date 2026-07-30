@@ -19,6 +19,7 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Browser admin dashboard interactions and richer lead detail views connected
 - Signed CRM webhook delivery, concurrent retry processing, and filtered CSV export
 - Signed worker alert routing for stalled queues, high error rates, and repeated batch crashes
+- Split admin/monitoring credentials, public intake limits, safe retry visibility, and sanitized health logs
 
 ## Runtime
 
@@ -62,13 +63,7 @@ When `QUEUE_METRICS_TOKEN` is configured, monitoring callers may send:
 Authorization: Bearer <QUEUE_METRICS_TOKEN>
 ```
 
-The browser admin dashboard sends the same token as:
-
-```http
-X-Admin-Token: <QUEUE_METRICS_TOKEN>
-```
-
-Production requires `QUEUE_METRICS_TOKEN`, so `/health/queue` is protected in deployed environments. The endpoint exposes only aggregate counters and never returns raw lead text, contact details, or lead IDs.
+Production requires `QUEUE_METRICS_TOKEN`, so `/health/queue` is protected in deployed environments. This endpoint accepts the monitoring token only through bearer authorization; `ADMIN_TOKEN` and `X-Admin-Token` are not accepted. The endpoint exposes only aggregate counters and never returns raw lead text, contact details, or lead IDs.
 
 ### Lead Inquiry Contract
 
@@ -120,6 +115,8 @@ Duplicate response:
 
 The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a duplicate that returns an existing lead. It saves the lead with `classification_status = "pending"` and does not echo the full raw customer message. The API route does not call OpenAI, generate fake classification values, or push to a CRM; classification is handled separately by the worker jobs.
 
+Public intake is limited per connecting client by `RATE_LIMIT_PER_MINUTE` and `RATE_LIMIT_PER_HOUR`. Rejected requests return `429 Too Many Requests` with `Retry-After`. `X-Forwarded-For` is considered only when the immediate peer belongs to `TRUSTED_PROXY_CIDRS`; the nearest untrusted hop is selected from right to left, and malformed chains fall back to the socket peer. Configure only proxy ranges that sanitize or append forwarding headers correctly. The built-in limiter is process-local, so multi-instance production deployments must also enforce a shared limit at the edge or through a shared store such as Redis.
+
 ### Admin Lead Read API
 
 ```http
@@ -129,10 +126,10 @@ GET /api/leads/export/csv
 POST /api/leads/{id}/sync
 ```
 
-Both read endpoints require:
+All four admin endpoints require:
 
 ```http
-X-Admin-Token: <QUEUE_METRICS_TOKEN>
+X-Admin-Token: <ADMIN_TOKEN>
 ```
 
 Supported list query parameters:
@@ -150,7 +147,7 @@ Example:
 
 ```powershell
 $headers = @{
-    "X-Admin-Token" = $env:QUEUE_METRICS_TOKEN
+    "X-Admin-Token" = $env:ADMIN_TOKEN
 }
 
 Invoke-RestMethod `
@@ -158,7 +155,7 @@ Invoke-RestMethod `
     -Headers $headers
 ```
 
-Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, sync status, sync timestamp, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, raw integration errors, or retry error details.
+Read responses intentionally expose only the admin-safe fields needed for review: contact fields, original message, classification status, urgency, summary, attempt count, sync status, sync timestamp, derived retry state (`scheduled`, `manual`, or `exhausted`), next-attempt timestamp, retry count, and timestamps. They do not return `idempotency_key`, `deduplication_bucket`, service-role keys, classification error internals, worker claim fields, raw integration errors, or retry error details.
 
 `GET /api/leads/export/csv` accepts the same filters as the lead list endpoint plus bounded `limit` and `offset` controls. It streams `classified_leads_export.csv` with only `ID`, `Source`, `Customer Name`, `Customer Email`, `Customer Phone`, `Status`, `Urgency`, `Summary`, and `Created At`. Exported cells are escaped when they look like spreadsheet formulas.
 
@@ -179,15 +176,15 @@ The signature input is the UTF-8 byte sequence `<timestamp>.<raw-request-body>`.
 GET /admin
 ```
 
-The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to store it in browser `localStorage` and load queue metrics plus protected lead data from the existing endpoints. The lead table opens a full admin-safe detail view, classified leads can be deliberately synced through the existing CRM boundary, and CSV exports reuse the active status and urgency filters. Clearing the token immediately aborts active protected queue, list, detail, sync, and CSV requests before clearing rendered data.
+The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter distinct `ADMIN_TOKEN` and `QUEUE_METRICS_TOKEN` values in the page; each is stored under its own browser `localStorage` key and sent only to its intended endpoints. The lead table opens a full admin-safe detail view, including derived CRM retry state, and classified leads can be deliberately synced through the existing CRM boundary. CSV exports reuse the active status and urgency filters. Saving or clearing credentials immediately aborts active protected requests; clearing either credential also clears its rendered data.
 
 The page uses:
 
-- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /health/queue`
-- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads`
-- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads/{id}`
-- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `POST /api/leads/{id}/sync`
-- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads/export/csv`
+- `Authorization: Bearer <QUEUE_METRICS_TOKEN>` for `GET /health/queue`
+- `X-Admin-Token: <ADMIN_TOKEN>` for `GET /api/leads`
+- `X-Admin-Token: <ADMIN_TOKEN>` for `GET /api/leads/{id}`
+- `X-Admin-Token: <ADMIN_TOKEN>` for `POST /api/leads/{id}/sync`
+- `X-Admin-Token: <ADMIN_TOKEN>` for `GET /api/leads/export/csv`
 
 ## Idempotency
 
@@ -332,9 +329,9 @@ Run the long-lived retry consumer:
 .\.venv\Scripts\python.exe -m app.jobs.crm_sync_daemon --limit 10 --sleep-seconds 30 --worker-id crm-local-1
 ```
 
-The initial retry delay is `CRM_RETRY_BASE_SECONDS`. Each failed worker retry for HTTP `429`, HTTP `5xx`, or a transport failure doubles the delay up to `CRM_RETRY_MAX_SECONDS`. After `CRM_RETRY_MAX_ATTEMPTS`, the lead remains failed with no next-attempt timestamp. Non-`429` HTTP `4xx` responses are not automatically retried.
+The initial retry delay is `CRM_RETRY_BASE_SECONDS`. Each failed worker retry for HTTP `429`, HTTP `5xx`, or a transport failure doubles the delay up to `CRM_RETRY_MAX_SECONDS`. Retry timestamps are calculated after the outbound attempt finishes, so request latency does not consume the backoff interval. After `CRM_RETRY_MAX_ATTEMPTS`, the lead remains failed with no next-attempt timestamp. Non-`429` HTTP `4xx` responses are not automatically retried.
 
-Migration `007` must be applied before running this daemon or using sync updates from this version. No Docker, hosting-provider, or deployed worker orchestration was added or verified by this milestone; the existing Compose file still launches only the API and classification worker.
+Migration `007` must be applied before running this daemon or using sync updates from this version. Compose now defines a dedicated CRM retry worker, but no hosting-provider deployment has been performed or verified.
 
 ## Worker Alert Routing
 
@@ -352,12 +349,15 @@ Repeated-crash counting is process-local and covers batch exceptions recovered b
 
 ## Docker
 
-The Docker image uses Python 3.12 to match the project runtime constraint in `pyproject.toml`. The same application image is used for both services. `docker-compose.yml` starts:
+The Docker image uses Python 3.12 to match the project runtime constraint in `pyproject.toml`. The same application image is used for all three services. `docker-compose.yml` starts:
 
-- `api`: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+- `api`: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers`
 - `worker`: `python -m app.jobs.classification_daemon --worker-id docker-worker-1`
+- `crm-sync-worker`: `python -m app.jobs.crm_sync_daemon --worker-id docker-crm-sync-worker-1`
 
-Both services read environment variables from `.env`. Keep `.env` local only; it contains Supabase and OpenAI secrets and is excluded from Git and Docker build context.
+All services read environment variables from `.env`. Keep `.env` local only; it contains Supabase, OpenAI, CRM, and alert secrets and is excluded from Git and Docker build context.
+
+Container and hosted API commands use `--no-proxy-headers` so Uvicorn leaves the socket peer unchanged and the application can enforce `TRUSTED_PROXY_CIDRS` itself. Do not enable Uvicorn proxy-header rewriting at the same time as the application resolver.
 
 Validate the Compose file without printing resolved secret values:
 
@@ -371,10 +371,10 @@ Build the image:
 docker compose build
 ```
 
-Start both services:
+Start all services:
 
 ```powershell
-docker compose up -d api worker
+docker compose up -d api worker crm-sync-worker
 ```
 
 Verify the API health endpoint:
@@ -386,7 +386,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 Inspect daemon activity without exposing raw customer messages:
 
 ```powershell
-docker compose logs --tail 50 worker
+docker compose logs --tail 50 worker crm-sync-worker
 ```
 
 Stop the stack:
@@ -402,6 +402,7 @@ Production startup intentionally fails fast for unsafe configuration. When `ENVI
 - `DEBUG=true`
 - wildcard, localhost, or `127.0.0.1` CORS origins
 - placeholder or short `JWT_SECRET` values
+- missing, short, or reused `ADMIN_TOKEN` and `QUEUE_METRICS_TOKEN` values
 - blank required service credentials
 - partial CRM or alert webhook configuration
 - non-HTTPS webhook URLs, short webhook secrets, or reused CRM/alert signing secrets
@@ -414,7 +415,7 @@ Generate production secrets locally and paste them into the hosting provider sec
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-Use one generated value for `JWT_SECRET` and a different generated value for `QUEUE_METRICS_TOKEN`.
+Use separate generated values for `JWT_SECRET`, `ADMIN_TOKEN`, and `QUEUE_METRICS_TOKEN`.
 
 Required production environment variables:
 
@@ -430,10 +431,14 @@ Required production environment variables:
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` unless using a compatible gateway |
 | `OPENAI_MODEL` | known supported model, currently `gpt-4.1-mini` |
 | `ALLOWED_ORIGINS` | JSON list of deployed frontend origins only |
+| `ADMIN_TOKEN` | generated admin API token with at least 24 characters |
 | `QUEUE_METRICS_TOKEN` | generated monitoring token with at least 24 characters |
 | `JWT_SECRET` | generated secret with at least 32 characters |
 | `REQUEST_MAX_BYTES` | request body limit, default `32768` |
 | `DEDUP_WINDOW_DAYS` | idempotency bucket window, default `7` |
+| `RATE_LIMIT_PER_MINUTE` | process-local public intake minute limit, default `60` |
+| `RATE_LIMIT_PER_HOUR` | process-local public intake hour limit, default `1000` |
+| `TRUSTED_PROXY_CIDRS` | JSON list of proxy IP/CIDR ranges allowed to supply `X-Forwarded-For`; default `[]` |
 
 Feature-gated worker variables:
 
@@ -463,7 +468,9 @@ OPENAI_API_KEY=<server-only-openai-key>
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1-mini
 ALLOWED_ORIGINS=["https://your-frontend.example.com"]
+ADMIN_TOKEN=<generated-admin-token>
 QUEUE_METRICS_TOKEN=<generated-monitoring-token>
+TRUSTED_PROXY_CIDRS=["10.0.0.0/8"]
 JWT_SECRET=<generated-jwt-secret>
 REQUEST_MAX_BYTES=32768
 DEDUP_WINDOW_DAYS=7
@@ -526,7 +533,7 @@ Expected response shape:
 }
 ```
 
-The browser admin dashboard sends `X-Admin-Token`; bearer authorization is also accepted for monitoring tools.
+The browser admin dashboard sends this dedicated bearer credential for queue metrics. Its separate `ADMIN_TOKEN` is never accepted by this endpoint.
 
 Monitoring guidance:
 
@@ -539,14 +546,15 @@ Monitoring guidance:
 
 ### Cloud Deployment Runbook
 
-Use two runtime services from the same Docker image:
+Use three runtime services from the same Docker image:
 
 | Service | Public | Command |
 | --- | --- | --- |
-| API | Yes | `uvicorn app.main:app --host 0.0.0.0 --port 8000` |
-| Worker | No | `python -m app.jobs.classification_daemon --worker-id <stable-worker-id> --limit 10 --sleep-seconds 30` |
+| API | Yes | `uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers` |
+| Classification worker | No | `python -m app.jobs.classification_daemon --worker-id <stable-worker-id> --limit 10 --sleep-seconds 30` |
+| CRM sync worker | No | `python -m app.jobs.crm_sync_daemon --worker-id <stable-crm-worker-id> --limit 10 --sleep-seconds 30` |
 
-The API service must expose container port `8000`. The worker should not expose an HTTP port.
+The API service must expose container port `8000`. Neither worker should expose an HTTP port.
 
 #### Render Deployment
 
@@ -557,18 +565,23 @@ Official references: [Docker on Render](https://render.com/docs/docker), [Render
 3. Set the runtime/language to Docker and keep the Dockerfile path as `Dockerfile`.
 4. Configure the API service:
    - Name: `lead-triage-api`
-   - Docker command: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+   - Docker command: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers`
    - Port: `8000`
    - Health check path: `/health`
    - Environment variables: all required production variables from the table above
-5. Create a Background Worker from the same repository and Dockerfile.
-6. Configure the worker service:
+5. Create two Background Workers from the same repository and Dockerfile.
+6. Configure the classification worker service:
    - Name: `lead-triage-worker`
    - Docker command: `python -m app.jobs.classification_daemon --worker-id render-worker-1 --limit 10 --sleep-seconds 30`
    - Environment variables: same production variables as the API service
    - Instances: start with `1` worker until queue metrics show sustained backlog
-7. Deploy the API first, then the worker.
-8. Run smoke checks:
+7. Configure the CRM sync worker service:
+   - Name: `lead-triage-crm-sync-worker`
+   - Docker command: `python -m app.jobs.crm_sync_daemon --worker-id render-crm-worker-1 --limit 10 --sleep-seconds 30`
+   - Environment variables: same production variables as the API service
+   - Instances: start with `1` worker
+8. Deploy the API first, then both workers.
+9. Run smoke checks:
 
 ```powershell
 Invoke-RestMethod https://<api-host>/health
@@ -578,7 +591,7 @@ $headers = @{ Authorization = "Bearer $env:QUEUE_METRICS_TOKEN" }
 Invoke-RestMethod -Uri https://<api-host>/health/queue -Headers $headers
 ```
 
-9. Submit one test lead to `POST /api/leads`, confirm it returns `201` or `200`, then confirm the worker eventually reduces `pending_count`.
+10. Submit one test lead to `POST /api/leads`, confirm it returns `201` or `200`, then confirm the classification worker eventually reduces `pending_count`.
 
 #### Fly.io Deployment Notes
 
@@ -587,19 +600,20 @@ Official references: [Deploy with a Dockerfile](https://fly.io/docs/languages-an
 - Use the repository `Dockerfile`.
 - Store secrets with `fly secrets set`; do not put service-role keys in `fly.toml`.
 - Run the API as the public process listening on internal port `8000`.
-- Run the worker as a separate process or separate Fly app with the daemon command.
-- Set a stable worker ID such as `fly-worker-1`.
-- Keep the first deployment to one worker process until queue metrics justify scaling.
+- Run the classification and CRM sync daemons as separate processes or separate Fly apps.
+- Set stable worker IDs such as `fly-worker-1` and `fly-crm-worker-1`.
+- Keep the first deployment to one process for each worker type until metrics justify scaling.
 
 #### Railway Deployment Notes
 
 Official references: [Railway variables](https://docs.railway.com/variables) and [Railway environments](https://docs.railway.com/environments).
 
-- Create one service for the API and one service for the worker from the same repository.
-- Use the Dockerfile builder for both services.
+- Create one service each for the API, classification worker, and CRM sync worker from the same repository.
+- Use the Dockerfile builder for all three services.
 - Add production variables in the Railway Variables tab for each service.
-- Set the API start command to `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
-- Set the worker start command to `python -m app.jobs.classification_daemon --worker-id railway-worker-1 --limit 10 --sleep-seconds 30`.
+- Set the API start command to `uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers`.
+- Set the classification worker command to `python -m app.jobs.classification_daemon --worker-id railway-worker-1 --limit 10 --sleep-seconds 30`.
+- Set the CRM sync worker command to `python -m app.jobs.crm_sync_daemon --worker-id railway-crm-worker-1 --limit 10 --sleep-seconds 30`.
 - Keep production variables scoped to the production environment.
 
 ### Deployment Checklist
@@ -608,12 +622,12 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Confirm `OPENAI_API_KEY` is available only to server containers.
 4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
-5. Set `QUEUE_METRICS_TOKEN` and `JWT_SECRET` to generated, distinct values.
+5. Set `ADMIN_TOKEN`, `QUEUE_METRICS_TOKEN`, and `JWT_SECRET` to generated, distinct values.
 6. Run `docker compose config --quiet` locally before deploying.
-7. Build and start both API and worker services from the same image.
+7. Build and start the API, classification worker, and CRM sync worker from the same image.
 8. Verify `GET /health`, `GET /health/database`, and protected `GET /health/queue`.
 9. Submit one test lead and confirm the worker processes it.
-10. Confirm worker logs show batch counts, queue counters, retry/backoff visibility, and no raw customer message text.
+10. Confirm both worker logs show batch counts, queue counters, retry/backoff visibility, and no raw customer message text.
 11. Monitor repeated daemon errors, retry backlog, exhausted classification attempts, and API health check failures.
 
 Do not use `docker compose config` without `--quiet` in environments with real secrets; the non-quiet command prints resolved environment values.
@@ -657,4 +671,4 @@ Next implementation work should add, in order:
 
 1. Provider-specific CRM field mapping beyond the generic signed webhook contract
 2. Persistent incident state or external supervision for crash detection across process restarts
-3. Deployment automation and runtime orchestration for the CRM retry daemon
+3. Deployment automation and external runtime supervision

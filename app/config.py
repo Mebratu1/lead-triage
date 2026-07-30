@@ -1,6 +1,7 @@
 """Application configuration management using Pydantic Settings."""
 
 from functools import lru_cache
+from ipaddress import ip_network
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -47,7 +48,9 @@ class Settings(BaseSettings):
 
     # API
     allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:8000"]
+    admin_token: str | None = None
     queue_metrics_token: str | None = None
+    trusted_proxy_cidrs: list[str] = []
 
     # Outbound CRM integration
     crm_webhook_url: str | None = None
@@ -75,8 +78,8 @@ class Settings(BaseSettings):
     dedup_strategy: Literal["email", "phone", "both"] = "email"
 
     # Rate Limiting
-    rate_limit_per_minute: int = 60
-    rate_limit_per_hour: int = 1000
+    rate_limit_per_minute: int = Field(default=60, ge=1)
+    rate_limit_per_hour: int = Field(default=1000, ge=1)
 
     # JWT
     jwt_secret: str = "dev-secret-key-change-in-production"
@@ -108,7 +111,26 @@ class Settings(BaseSettings):
             raise ValueError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
         return cleaned
 
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def trusted_proxy_cidrs_must_be_valid(cls, values: list[str]) -> list[str]:
+        """Normalize explicitly trusted reverse-proxy address ranges."""
+        if len(values) > 32:
+            raise ValueError("TRUSTED_PROXY_CIDRS must contain at most 32 ranges")
+
+        normalized: list[str] = []
+        for value in values:
+            try:
+                network = ip_network(value.strip(), strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    "TRUSTED_PROXY_CIDRS must contain valid IP networks"
+                ) from exc
+            normalized.append(str(network))
+        return normalized
+
     @field_validator(
+        "admin_token",
         "queue_metrics_token",
         "crm_webhook_url",
         "crm_webhook_secret",
@@ -166,6 +188,14 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def production_settings_must_be_safe(self) -> "Settings":
         """Fail fast on unsafe production configuration."""
+        if (
+            self.admin_token is not None
+            and self.admin_token == self.queue_metrics_token
+        ):
+            raise ValueError(
+                "ADMIN_TOKEN must be distinct from QUEUE_METRICS_TOKEN"
+            )
+
         if (self.crm_webhook_url is None) != (self.crm_webhook_secret is None):
             raise ValueError(
                 "CRM_WEBHOOK_URL and CRM_WEBHOOK_SECRET must be configured together"
@@ -205,6 +235,12 @@ class Settings(BaseSettings):
         if self.queue_metrics_token is None or len(self.queue_metrics_token) < 24:
             raise ValueError(
                 "QUEUE_METRICS_TOKEN must be configured with at least 24 characters "
+                "in production"
+            )
+
+        if self.admin_token is None or len(self.admin_token) < 24:
+            raise ValueError(
+                "ADMIN_TOKEN must be configured with at least 24 characters "
                 "in production"
             )
 

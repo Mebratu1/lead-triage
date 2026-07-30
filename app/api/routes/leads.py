@@ -8,13 +8,23 @@ from secrets import compare_digest
 from typing import Annotated, Iterator
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from supabase import AsyncClient
 
 from app.config import settings
 from app.db.client import get_db
 from app.models.classification import LeadClassificationStatus, LeadUrgency
+from app.models.integration import crm_retry_state
 from app.models.lead import (
     LeadCreateRequest,
     LeadIntegrationStatus,
@@ -40,6 +50,10 @@ from app.services.lead_persistence import (
     LeadLookupFailed,
     LeadUnexpectedPersistenceFailure,
     persist_lead,
+)
+from app.services.rate_limiter import (
+    LeadIntakeRateLimiter,
+    TrustedProxyClientIpResolver,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +86,7 @@ CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 def require_admin_access(x_admin_token: AdminToken = None) -> None:
     """Require the configured admin token for read-side lead access."""
-    expected_token = settings.queue_metrics_token
+    expected_token = settings.admin_token
     if expected_token is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -83,6 +97,25 @@ def require_admin_access(x_admin_token: AdminToken = None) -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
+        )
+
+
+async def enforce_lead_intake_rate_limit(request: Request) -> None:
+    """Reject abusive public intake traffic before database access."""
+    limiter: LeadIntakeRateLimiter = request.app.state.lead_intake_rate_limiter
+    resolver: TrustedProxyClientIpResolver = (
+        request.app.state.trusted_proxy_client_ip_resolver
+    )
+    client_key = resolver.resolve(
+        peer_host=request.client.host if request.client is not None else None,
+        forwarded_for=request.headers.get("X-Forwarded-For"),
+    )
+    decision = await limiter.check(client_key)
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Lead intake rate limit exceeded",
+            headers={"Retry-After": str(decision.retry_after_seconds or 1)},
         )
 
 
@@ -104,6 +137,17 @@ def _public_lead_from_row(row: dict) -> LeadPublicResponse:
             row.get("integration_status") or LeadIntegrationStatus.PENDING
         ),
         integration_last_synced_at=row.get("integration_last_synced_at"),
+        integration_retry_state=crm_retry_state(
+            integration_status=(
+                row.get("integration_status") or LeadIntegrationStatus.PENDING
+            ),
+            next_attempt_at=row.get("integration_next_attempt_at"),
+            error_reason=row.get("integration_error"),
+        ),
+        integration_next_attempt_at=row.get("integration_next_attempt_at"),
+        integration_retry_attempt_count=(
+            row.get("integration_retry_attempt_count") or 0
+        ),
         created_at=row["created_at"],
         updated_at=updated_at,
     )
@@ -119,6 +163,15 @@ def _sync_response_from_row(
         id=row["id"],
         integration_status=row["integration_status"],
         integration_last_synced_at=row.get("integration_last_synced_at"),
+        integration_retry_state=crm_retry_state(
+            integration_status=row["integration_status"],
+            next_attempt_at=row.get("integration_next_attempt_at"),
+            error_reason=row.get("integration_error"),
+        ),
+        integration_next_attempt_at=row.get("integration_next_attempt_at"),
+        integration_retry_attempt_count=(
+            row.get("integration_retry_attempt_count") or 0
+        ),
         retry_after_seconds=retry_after_seconds,
         detail=detail,
     )
@@ -522,6 +575,7 @@ async def read_lead(
 async def create_lead(
     request: LeadCreateRequest,
     response: Response,
+    _: None = Depends(enforce_lead_intake_rate_limit),
     db: AsyncClient = Depends(get_db),
 ) -> LeadPersistedResponse:
     """Persist the public lead request contract without classification yet."""

@@ -10,6 +10,10 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+class SupabaseClientInitializationError(RuntimeError):
+    """Raised without retaining provider exception text in server output."""
+
+
 class SupabaseClient:
     """Manages Supabase connection lifecycle."""
 
@@ -19,16 +23,21 @@ class SupabaseClient:
     async def get_client(cls) -> AsyncClient:
         """Get or create Supabase async client."""
         if cls._instance is None:
-            logger.info(f"Initializing Supabase client: {settings.supabase_url}")
+            logger.info("Initializing Supabase client")
             try:
                 cls._instance = await acreate_client(
                     supabase_url=settings.supabase_url,
                     supabase_key=settings.supabase_service_role_key,
                 )
                 logger.info("Supabase client initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize Supabase client: {str(e)}")
-                raise
+            except Exception as exc:
+                logger.error(
+                    "Failed to initialize Supabase client error_type=%s",
+                    exc.__class__.__name__,
+                )
+                raise SupabaseClientInitializationError(
+                    "Supabase client initialization failed"
+                ) from None
         return cls._instance
 
     @classmethod

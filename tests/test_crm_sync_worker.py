@@ -178,6 +178,54 @@ class TestCrmSyncWorker:
         assert updates[0]["retry_after_seconds"] is None
 
     @pytest.mark.unit
+    def test_backoff_is_timestamped_after_delivery_attempt_finishes(self, monkeypatch):
+        """Test slow outbound attempts do not consume their own retry delay."""
+        started_at = datetime(2026, 7, 30, 12, 15, tzinfo=UTC)
+        finished_at = datetime(2026, 7, 30, 12, 17, tzinfo=UTC)
+        current_time = [started_at]
+        updates: list[dict[str, Any]] = []
+
+        class AdvancingDispatcher:
+            async def sync_lead(self, lead) -> None:
+                current_time[0] = finished_at
+                raise CrmDeliveryRetryableError(
+                    "crm_retryable_response",
+                    status_code=503,
+                )
+
+        async def claim(**kwargs):
+            return [claimed_row(retry_attempt_count=1)]
+
+        async def update(**kwargs):
+            updates.append(kwargs)
+            return {"id": kwargs["lead_id"]}
+
+        monkeypatch.setattr(
+            "app.services.crm_sync_worker.claim_due_leads_for_crm_sync",
+            claim,
+        )
+        monkeypatch.setattr(
+            "app.services.crm_sync_worker.update_lead_integration_status",
+            update,
+        )
+
+        result = asyncio.run(
+            process_due_crm_sync_batch(
+                db=object(),
+                dispatcher=AdvancingDispatcher(),
+                worker_id="worker-1",
+                retry_base_seconds=60,
+                retry_max_seconds=600,
+                clock=lambda: current_time[0],
+            )
+        )
+
+        assert result.retry_scheduled == 1
+        assert updates[0]["now"] == finished_at
+        assert updates[0]["now"] != started_at
+        assert updates[0]["retry_after_seconds"] == 120
+
+    @pytest.mark.unit
     def test_exponential_delay_is_capped(self):
         """Test large retry counts cannot exceed the configured cap."""
         assert (

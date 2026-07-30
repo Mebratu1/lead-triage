@@ -325,8 +325,8 @@ class TestQueueHealthEndpoint:
         assert payload["exhausted_count"] == 2
 
     @pytest.mark.unit
-    def test_queue_health_accepts_valid_admin_token_header(self, client, monkeypatch):
-        """Test browser admin token header can read aggregate counters."""
+    def test_queue_health_rejects_admin_token_header(self, client, monkeypatch):
+        """Test queue metrics only accept the dedicated bearer credential."""
         monkeypatch.setattr("app.routes.health.settings.queue_metrics_token", TOKEN)
         database = FakeQueueDatabase(rows=queue_rows())
         client.app.dependency_overrides[get_db] = db_override(database)
@@ -338,11 +338,29 @@ class TestQueueHealthEndpoint:
         finally:
             client.app.dependency_overrides.clear()
 
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["pending_count"] == 4
-        assert payload["backoff_count"] >= 0
-        assert payload["exhausted_count"] == 2
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Queue health authorization required"}
+
+    @pytest.mark.unit
+    def test_queue_health_rejects_admin_bearer_token(self, client, monkeypatch):
+        """Test the admin credential cannot authorize monitoring access."""
+        monkeypatch.setattr("app.routes.health.settings.queue_metrics_token", TOKEN)
+        monkeypatch.setattr(
+            "app.routes.health.settings.admin_token",
+            "distinct-admin-token",
+        )
+        database = FakeQueueDatabase(rows=queue_rows())
+        client.app.dependency_overrides[get_db] = db_override(database)
+        try:
+            response = client.get(
+                "/health/queue",
+                headers={"Authorization": "Bearer distinct-admin-token"},
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Queue health authorization required"}
 
     @pytest.mark.unit
     def test_queue_health_database_failure_is_safe(self, client, monkeypatch, caplog):

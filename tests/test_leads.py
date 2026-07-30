@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING
@@ -18,6 +19,7 @@ from app.services.lead_persistence import (
     generate_idempotency_key,
     persist_lead,
 )
+from app.services.rate_limiter import LeadIntakeRateLimiter
 
 if TYPE_CHECKING:
     from starlette.testclient import TestClient
@@ -179,13 +181,18 @@ def existing_lead(
     }
 
 
-def post_lead(client: TestClient, database: FakeLeadDatabase, payload: dict[str, Any]):
+def post_lead(
+    client: TestClient,
+    database: FakeLeadDatabase,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+):
     async def override_get_db():
         yield database
 
     client.app.dependency_overrides[get_db] = override_get_db
     try:
-        return client.post("/api/leads", json=payload)
+        return client.post("/api/leads", json=payload, headers=headers)
     finally:
         client.app.dependency_overrides.clear()
 
@@ -241,6 +248,34 @@ class TestHealthCheck:
 
         assert response.status_code == 200
         assert response.json() == {"status": "ok", "database": "connected"}
+
+    @pytest.mark.unit
+    def test_database_health_failure_does_not_log_raw_exception(
+        self,
+        client: TestClient,
+        caplog,
+    ):
+        """Test database health logs only a safe exception category."""
+        secret_text = "raw-service-role-key-and-customer-message"
+
+        class FailingDatabase:
+            def table(self, name: str):
+                assert name == "leads"
+                raise RuntimeError(secret_text)
+
+        async def override_get_db():
+            yield FailingDatabase()
+
+        client.app.dependency_overrides[get_db] = override_get_db
+        with caplog.at_level(logging.WARNING):
+            try:
+                response = client.get("/health/database")
+            finally:
+                client.app.dependency_overrides.clear()
+
+        assert response.status_code == 503
+        assert "error_type=RuntimeError" in caplog.text
+        assert secret_text not in caplog.text
 
 
 class TestLeadPersistenceContract:
@@ -638,6 +673,87 @@ class TestLeadPersistenceContract:
         assert response.status_code == 422
 
     @pytest.mark.unit
+    def test_create_lead_rate_limit_returns_429_without_database_write(
+        self,
+        client: TestClient,
+    ):
+        """Test the app-scoped limiter deterministically rejects intake abuse."""
+        now = [100.0]
+        client.app.state.lead_intake_rate_limiter = LeadIntakeRateLimiter(
+            per_minute=2,
+            per_hour=10,
+            clock=lambda: now[0],
+        )
+        database = FakeLeadDatabase()
+
+        first = post_lead(
+            client,
+            database,
+            {"message": "Please contact me about plumbing request one."},
+        )
+        second = post_lead(
+            client,
+            database,
+            {"message": "Please contact me about plumbing request two."},
+        )
+        limited = post_lead(
+            client,
+            database,
+            {"message": "Please contact me about plumbing request three."},
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert limited.status_code == 429
+        assert limited.json() == {"detail": "Lead intake rate limit exceeded"}
+        assert limited.headers["retry-after"] == "60"
+        assert database.insert_count == 2
+
+    @pytest.mark.unit
+    def test_create_lead_passes_forwarded_chain_to_client_ip_resolver(
+        self,
+        client: TestClient,
+    ):
+        """Test intake wiring supplies both peer and forwarding context."""
+        calls: list[tuple[str | None, str | None]] = []
+
+        class RecordingResolver:
+            def resolve(
+                self,
+                *,
+                peer_host: str | None,
+                forwarded_for: str | None,
+            ) -> str:
+                calls.append((peer_host, forwarded_for))
+                return "198.51.100.8"
+
+        client.app.state.trusted_proxy_client_ip_resolver = RecordingResolver()
+        client.app.state.lead_intake_rate_limiter = LeadIntakeRateLimiter(
+            per_minute=1,
+            per_hour=10,
+        )
+        database = FakeLeadDatabase()
+        headers = {"X-Forwarded-For": "203.0.113.250, 198.51.100.8"}
+
+        first = post_lead(
+            client,
+            database,
+            {"message": "Please contact me about forwarded request one."},
+            headers=headers,
+        )
+        limited = post_lead(
+            client,
+            database,
+            {"message": "Please contact me about forwarded request two."},
+            headers=headers,
+        )
+
+        assert first.status_code == 201
+        assert limited.status_code == 429
+        assert len(calls) == 2
+        assert all(call[1] == headers["X-Forwarded-For"] for call in calls)
+
+    @pytest.mark.unit
     def test_create_lead_model_trims_and_normalizes(self):
         """Test model-level whitespace handling and source normalization."""
         request = LeadCreateRequest(
@@ -694,3 +810,32 @@ class TestSupabaseClientConfiguration:
 
         assert captured["supabase_key"] == "test-service-role-key"
         assert captured["supabase_key"] != "test-anon-key"
+
+    @pytest.mark.unit
+    def test_database_client_initialization_failure_does_not_log_exception_text(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        """Test initialization errors retain type context without secret text."""
+        import app.db.client as db_client
+
+        secret_text = "raw-service-role-key-and-project-url"
+
+        async def failing_create_client(supabase_url: str, supabase_key: str):
+            raise RuntimeError(secret_text)
+
+        monkeypatch.setattr(db_client, "acreate_client", failing_create_client)
+        db_client.SupabaseClient._instance = None
+        try:
+            with caplog.at_level(logging.ERROR):
+                with pytest.raises(
+                    db_client.SupabaseClientInitializationError,
+                    match="Supabase client initialization failed",
+                ):
+                    asyncio.run(db_client.SupabaseClient.get_client())
+        finally:
+            db_client.SupabaseClient._instance = None
+
+        assert "error_type=RuntimeError" in caplog.text
+        assert secret_text not in caplog.text

@@ -41,7 +41,7 @@ class TestDockerfile:
 
         assert (
             'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", '
-            '"--port", "8000"]'
+            '"--port", "8000", "--no-proxy-headers"]'
         ) in dockerfile
 
 
@@ -58,6 +58,7 @@ class TestDockerCompose:
         assert "      - app.main:app" in compose
         assert "      - 0.0.0.0" in compose
         assert '      - "8000"' in compose
+        assert "      - --no-proxy-headers" in compose
         assert "    env_file:\n      - .env" in compose
         assert '      - "8000:8000"' in compose
         assert "    healthcheck:" in compose
@@ -73,8 +74,19 @@ class TestDockerCompose:
         assert "      - app.jobs.classification_daemon" in compose
         assert "      - --worker-id" in compose
         assert "      - docker-worker-1" in compose
-        assert compose.count("    env_file:\n      - .env") == 2
+        assert compose.count("    env_file:\n      - .env") == 3
         assert "    stop_grace_period: 2m" in compose
+
+    @pytest.mark.unit
+    def test_crm_sync_worker_service_runs_retry_daemon(self):
+        """Test scheduled CRM retries have a long-running queue consumer."""
+        compose = read_project_file("docker-compose.yml")
+
+        assert "  crm-sync-worker:" in compose
+        assert "      - app.jobs.crm_sync_daemon" in compose
+        assert "      - docker-crm-sync-worker-1" in compose
+        assert "    restart: always" in compose
+        assert compose.count("    stop_grace_period: 2m") == 2
 
     @pytest.mark.unit
     def test_compose_does_not_hardcode_secret_values(self):

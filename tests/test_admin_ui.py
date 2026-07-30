@@ -33,7 +33,9 @@ class TestAdminDashboard:
         assert "https://cdn.tailwindcss.com" not in html
         assert "<script src=" not in html
         assert 'id="adminToken"' in html
+        assert 'id="queueToken"' in html
         assert "lead_triage_admin_token" in html
+        assert "lead_triage_queue_metrics_token" in html
         assert 'id="pendingCount"' in html
         assert 'id="backoffCount"' in html
         assert 'id="exhaustedCount"' in html
@@ -50,10 +52,10 @@ class TestAdminDashboard:
 
         assert 'fetch("/health/queue"' in html
         assert '`/api/leads?${params.toString()}`' in html
-        assert '"X-Admin-Token": token' in html
+        assert 'return token ? { "X-Admin-Token": token } : {}' in html
+        assert "return token ? { Authorization: `Bearer ${token}` } : {}" in html
         assert 'params.set("classification_status", statusFilter.value)' in html
         assert 'params.set("urgency", urgencyFilter.value)' in html
-        assert "Authorization: `Bearer ${token}`" not in html
         assert "X-Queue-Metrics-Token" not in html
         assert "params.set(\"status\"" not in html
 
@@ -95,6 +97,9 @@ class TestAdminDashboard:
         assert "Classification attempts" in html
         assert "CRM integration" in html
         assert "Last CRM sync" in html
+        assert "CRM retry state" in html
+        assert "Next CRM attempt" in html
+        assert "CRM retry attempts" in html
         assert "Original message" in html
         assert "AI summary" in html
 
@@ -111,7 +116,8 @@ class TestAdminDashboard:
         assert '`/api/leads/${encodeURIComponent(leadId)}/sync`' in html
         assert '`/api/leads/export/csv?${params.toString()}`' in html
         assert 'method: "POST"' in html
-        assert 'headers: getAuthHeaders()' in html
+        assert 'headers: getAdminAuthHeaders()' in html
+        assert 'headers: getQueueAuthHeaders()' in html
         assert 'id="exportCsvButton"' in html
         assert 'class="button-secondary button-small view-lead-button"' in html
 
@@ -149,6 +155,13 @@ class TestAdminDashboard:
         assert "syncAbortController.abort()" in html
         assert "exportAbortController.abort()" in html
         assert "function cancelProtectedRequests()" in html
+        assert "function cancelAdminRequests()" in html
+        assert "function cancelQueueRequest()" in html
+        assert "function showEmptyLeadDetail()" in html
+        assert "const adminTokenChanged = adminToken !== getAdminToken()" in html
+        assert "const queueTokenChanged = queueToken !== getQueueToken()" in html
+        assert 'if (error.name === "AbortError")' in html
+        assert "leadDetailContent.removeAttribute(\"aria-busy\")" in html
         assert "cancelProtectedRequests();" in html
         assert "signal: requestController.signal" in html
         assert 'error.name === "AbortError"' in html

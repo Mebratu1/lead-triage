@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -13,6 +14,7 @@ from app.models.integration import (
     CrmSyncBatchResult,
     CrmSyncOutcome,
     CrmSyncWorkItemResult,
+    crm_retry_state,
 )
 from app.models.lead import LeadIntegrationStatus
 from app.models.schemas import LeadPublicResponse
@@ -88,6 +90,17 @@ def _public_lead(row: dict[str, Any]) -> LeadPublicResponse:
             row.get("integration_status") or LeadIntegrationStatus.FAILED
         ),
         integration_last_synced_at=row.get("integration_last_synced_at"),
+        integration_retry_state=crm_retry_state(
+            integration_status=(
+                row.get("integration_status") or LeadIntegrationStatus.FAILED
+            ),
+            next_attempt_at=row.get("integration_next_attempt_at"),
+            error_reason=row.get("integration_error"),
+        ),
+        integration_next_attempt_at=row.get("integration_next_attempt_at"),
+        integration_retry_attempt_count=(
+            row.get("integration_retry_attempt_count") or 0
+        ),
         created_at=row["created_at"],
         updated_at=updated_at,
     )
@@ -150,6 +163,7 @@ async def process_due_crm_sync_batch(
     retry_max_seconds: int = DEFAULT_CRM_RETRY_MAX_SECONDS,
     max_attempts: int = DEFAULT_CRM_RETRY_MAX_ATTEMPTS,
     completed_at: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> CrmSyncBatchResult:
     """Claim and process one bounded batch of due CRM webhook retries."""
     if limit < 1 or limit > MAX_CRM_RETRY_BATCH_SIZE:
@@ -162,7 +176,7 @@ async def process_due_crm_sync_batch(
         raise ValueError("max_attempts must be at least 1")
 
     active_worker_id = _worker_id(worker_id)
-    finished_at = completed_at or datetime.now(UTC)
+    completion_clock = clock or (lambda: datetime.now(UTC))
     try:
         claimed_leads = await claim_due_leads_for_crm_sync(
             db=db,
@@ -192,7 +206,7 @@ async def process_due_crm_sync_batch(
                     worker_id=active_worker_id,
                     integration_status=LeadIntegrationStatus.FAILED,
                     error_reason="crm_invalid_payload",
-                    completed_at=finished_at,
+                    completed_at=completed_at or completion_clock(),
                 )
             except (LeadRepositoryUpdateConflict, LeadRepositoryUpdateError):
                 results.append(
@@ -235,7 +249,7 @@ async def process_due_crm_sync_batch(
                     integration_status=LeadIntegrationStatus.FAILED,
                     error_reason=error_reason,
                     retry_after_seconds=retry_after_seconds,
-                    completed_at=finished_at,
+                    completed_at=completed_at or completion_clock(),
                 )
             except (LeadRepositoryUpdateConflict, LeadRepositoryUpdateError):
                 results.append(
@@ -272,7 +286,7 @@ async def process_due_crm_sync_batch(
                     worker_id=active_worker_id,
                     integration_status=LeadIntegrationStatus.FAILED,
                     error_reason=delivery_failure_reason,
-                    completed_at=finished_at,
+                    completed_at=completed_at or completion_clock(),
                 )
             except (LeadRepositoryUpdateConflict, LeadRepositoryUpdateError):
                 results.append(
@@ -298,7 +312,7 @@ async def process_due_crm_sync_batch(
                 lead_id=lead_id,
                 worker_id=active_worker_id,
                 integration_status=LeadIntegrationStatus.SYNCED,
-                completed_at=finished_at,
+                completed_at=completed_at or completion_clock(),
             )
         except LeadRepositoryUpdateConflict:
             results.append(

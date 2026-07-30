@@ -31,7 +31,6 @@ async def _resolve(value):
 
 def _authorize_queue_health(
     authorization: str | None,
-    x_admin_token: str | None,
 ) -> None:
     """Protect queue metrics when a monitoring token is configured."""
     expected_token = settings.queue_metrics_token
@@ -43,11 +42,7 @@ def _authorize_queue_health(
         authorization,
         expected_header,
     )
-    admin_token_authorized = x_admin_token is not None and compare_digest(
-        x_admin_token,
-        expected_token,
-    )
-    if bearer_authorized or admin_token_authorized:
+    if bearer_authorized:
         return
 
     raise HTTPException(
@@ -92,11 +87,14 @@ async def database_health_check(
         query = await _resolve(query.limit(1))
         await _resolve(query.execute())
     except Exception as exc:
-        logger.warning("Database health check failed: %s", exc)
+        logger.warning(
+            "Database health check failed error_type=%s",
+            exc.__class__.__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database health check failed",
-        ) from exc
+        ) from None
 
     return DatabaseHealthResponse(status="ok", database="connected")
 
@@ -105,12 +103,10 @@ async def database_health_check(
 async def queue_health_check(
     db: AsyncClient = Depends(get_db),
     authorization: str | None = Header(default=None),
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ) -> QueueHealthResponse:
     """Return aggregate classification queue counters for monitoring."""
     _authorize_queue_health(
         authorization=authorization,
-        x_admin_token=x_admin_token,
     )
 
     try:

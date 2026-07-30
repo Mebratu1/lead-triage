@@ -282,7 +282,7 @@ def csv_rows(response_text: str) -> list[dict[str, str]]:
 @pytest.fixture(autouse=True)
 def admin_token(monkeypatch):
     """Configure the admin token for all CRM/export API tests."""
-    monkeypatch.setattr("app.api.routes.leads.settings.queue_metrics_token", ADMIN_TOKEN)
+    monkeypatch.setattr("app.api.routes.leads.settings.admin_token", ADMIN_TOKEN)
 
 
 class TestLeadCsvExport:
@@ -431,6 +431,9 @@ class TestLeadCrmSync:
         assert body["id"] == "11111111-1111-4111-8111-111111111111"
         assert body["integration_status"] == "synced"
         assert body["integration_last_synced_at"] is not None
+        assert body["integration_retry_state"] is None
+        assert body["integration_next_attempt_at"] is None
+        assert body["integration_retry_attempt_count"] == 0
         assert body["retry_after_seconds"] is None
         assert body["detail"] == "Lead synced"
         assert database.rows[0]["integration_status"] == "synced"
@@ -524,6 +527,8 @@ class TestLeadCrmSync:
         body = response.json()
         assert body["integration_status"] == "failed"
         assert body["integration_last_synced_at"] is None
+        assert body["integration_retry_state"] == "manual"
+        assert body["integration_next_attempt_at"] is None
         assert body["retry_after_seconds"] is None
         assert body["detail"] == "CRM sync failed; manual retry required"
         assert database.rows[0]["integration_status"] == "failed"
@@ -566,6 +571,8 @@ class TestLeadCrmSync:
 
         assert response.status_code == 502
         assert response.json()["retry_after_seconds"] == 45
+        assert response.json()["integration_retry_state"] == "scheduled"
+        assert response.json()["integration_next_attempt_at"] is not None
         assert response.json()["detail"] == "CRM sync failed; retry scheduled"
         assert database.rows[0]["integration_error"] == "crm_retryable_failure"
         assert database.rows[0]["integration_next_attempt_at"] is not None
@@ -599,6 +606,7 @@ class TestLeadCrmSync:
 
         assert response.status_code == 502
         assert response.json()["retry_after_seconds"] is None
+        assert response.json()["integration_retry_state"] == "manual"
         assert (
             response.json()["detail"]
             == "CRM sync rejected; manual intervention required"

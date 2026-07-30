@@ -36,7 +36,8 @@ PENDING_LEAD_SELECT_FIELDS = "id,raw_message,source,classification_status,create
 LEAD_PUBLIC_SELECT_FIELDS = (
     "id,source,raw_message,customer_name,email,phone,classification_status,"
     "urgency,ai_summary,classification_attempt_count,created_at,classified_at,"
-    "integration_status,integration_last_synced_at"
+    "integration_status,integration_last_synced_at,integration_error,"
+    "integration_next_attempt_at,integration_retry_attempt_count"
 )
 LEAD_INTEGRATION_SELECT_FIELDS = (
     "id,integration_status,integration_last_synced_at,integration_error,"
@@ -44,8 +45,7 @@ LEAD_INTEGRATION_SELECT_FIELDS = (
     "integration_claimed_at,integration_claimed_by"
 )
 CLAIMED_CRM_LEAD_SELECT_FIELDS = (
-    f"{LEAD_PUBLIC_SELECT_FIELDS},integration_next_attempt_at,"
-    "integration_retry_attempt_count,integration_claimed_at,integration_claimed_by"
+    f"{LEAD_PUBLIC_SELECT_FIELDS},integration_claimed_at,integration_claimed_by"
 )
 SAFE_FAILURE_REASONS = {
     "invalid_json",

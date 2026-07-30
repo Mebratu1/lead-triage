@@ -10,6 +10,10 @@ from app.config import settings
 from app.db.client import SupabaseClient
 from app.api.routes import leads
 from app.routes import admin, health
+from app.services.rate_limiter import (
+    LeadIntakeRateLimiter,
+    TrustedProxyClientIpResolver,
+)
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -36,6 +40,13 @@ def create_app() -> FastAPI:
         version=settings.api_version,
         debug=settings.debug,
         lifespan=lifespan,
+    )
+    app.state.lead_intake_rate_limiter = LeadIntakeRateLimiter(
+        per_minute=settings.rate_limit_per_minute,
+        per_hour=settings.rate_limit_per_hour,
+    )
+    app.state.trusted_proxy_client_ip_resolver = TrustedProxyClientIpResolver(
+        settings.trusted_proxy_cidrs
     )
 
     # CORS Middleware
