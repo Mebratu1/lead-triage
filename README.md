@@ -55,10 +55,16 @@ GET /health/queue
 }
 ```
 
-When `QUEUE_METRICS_TOKEN` is configured, callers must send:
+When `QUEUE_METRICS_TOKEN` is configured, monitoring callers may send:
 
 ```http
 Authorization: Bearer <QUEUE_METRICS_TOKEN>
+```
+
+The browser admin dashboard sends the same token as:
+
+```http
+X-Admin-Token: <QUEUE_METRICS_TOKEN>
 ```
 
 Production requires `QUEUE_METRICS_TOKEN`, so `/health/queue` is protected in deployed environments. The endpoint exposes only aggregate counters and never returns raw lead text, contact details, or lead IDs.
@@ -156,11 +162,11 @@ Read responses intentionally expose only the admin-safe fields needed for review
 GET /admin
 ```
 
-The dashboard is a lightweight browser shell served by the FastAPI app. It does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to load queue metrics and protected lead data from the existing JSON endpoints.
+The dashboard is a lightweight, self-contained browser shell served by the FastAPI app. It does not load third-party scripts and does not embed secrets or data in the HTML. Enter `QUEUE_METRICS_TOKEN` in the page to store it in browser `localStorage` and load queue metrics plus protected lead data from the existing JSON endpoints.
 
 The page uses:
 
-- `Authorization: Bearer <QUEUE_METRICS_TOKEN>` for `GET /health/queue`
+- `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /health/queue`
 - `X-Admin-Token: <QUEUE_METRICS_TOKEN>` for `GET /api/leads`
 
 ## Idempotency
@@ -436,6 +442,8 @@ Expected response shape:
   "max_attempts": 5
 }
 ```
+
+The browser admin dashboard sends `X-Admin-Token`; bearer authorization is also accepted for monitoring tools.
 
 Monitoring guidance:
 

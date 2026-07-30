@@ -29,18 +29,31 @@ async def _resolve(value):
     return value
 
 
-def _authorize_queue_health(authorization: str | None) -> None:
+def _authorize_queue_health(
+    authorization: str | None,
+    x_admin_token: str | None,
+) -> None:
     """Protect queue metrics when a monitoring token is configured."""
     expected_token = settings.queue_metrics_token
     if expected_token is None:
         return
 
     expected_header = f"Bearer {expected_token}"
-    if authorization is None or not compare_digest(authorization, expected_header):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Queue health authorization required",
-        )
+    bearer_authorized = authorization is not None and compare_digest(
+        authorization,
+        expected_header,
+    )
+    admin_token_authorized = x_admin_token is not None and compare_digest(
+        x_admin_token,
+        expected_token,
+    )
+    if bearer_authorized or admin_token_authorized:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Queue health authorization required",
+    )
 
 
 @router.get("/health", response_model=HealthCheckResponse)
@@ -92,9 +105,13 @@ async def database_health_check(
 async def queue_health_check(
     db: AsyncClient = Depends(get_db),
     authorization: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ) -> QueueHealthResponse:
     """Return aggregate classification queue counters for monitoring."""
-    _authorize_queue_health(authorization)
+    _authorize_queue_health(
+        authorization=authorization,
+        x_admin_token=x_admin_token,
+    )
 
     try:
         metrics = await get_classification_queue_metrics(

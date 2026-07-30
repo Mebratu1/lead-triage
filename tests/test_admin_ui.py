@@ -1,4 +1,4 @@
-"""Tests for the browser admin dashboard shell."""
+"""Tests for the browser admin dashboard foundation."""
 
 from __future__ import annotations
 
@@ -20,8 +20,27 @@ class TestAdminDashboard:
 
         assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
-        assert "<title>LeadTriage Admin</title>" in response.text
+        assert "<title>LeadTriage Admin Dashboard</title>" in response.text
         assert "LeadTriage Admin" in response.text
+
+    @pytest.mark.unit
+    def test_admin_dashboard_renders_required_markup(self, client: TestClient):
+        """Test dashboard includes token, telemetry, filters, and table markup."""
+        response = client.get("/admin")
+        html = response.text
+
+        assert "<style>" in html
+        assert "https://cdn.tailwindcss.com" not in html
+        assert "<script src=" not in html
+        assert 'id="adminToken"' in html
+        assert "lead_triage_admin_token" in html
+        assert 'id="pendingCount"' in html
+        assert 'id="backoffCount"' in html
+        assert 'id="exhaustedCount"' in html
+        assert 'id="maxAttempts"' in html
+        assert 'id="statusFilter"' in html
+        assert 'id="urgencyFilter"' in html
+        assert 'id="leadsTableBody"' in html
 
     @pytest.mark.unit
     def test_admin_dashboard_uses_existing_api_contracts(self, client: TestClient):
@@ -30,10 +49,11 @@ class TestAdminDashboard:
         html = response.text
 
         assert 'fetch("/health/queue"' in html
-        assert "Authorization: `Bearer ${token}`" in html
         assert '`/api/leads?${params.toString()}`' in html
         assert '"X-Admin-Token": token' in html
         assert 'params.set("classification_status", statusFilter.value)' in html
+        assert 'params.set("urgency", urgencyFilter.value)' in html
+        assert "Authorization: `Bearer ${token}`" not in html
         assert "X-Queue-Metrics-Token" not in html
         assert "params.set(\"status\"" not in html
 
@@ -49,6 +69,15 @@ class TestAdminDashboard:
         assert '<option value="high">High</option>' not in html
         assert '<option value="medium">Medium</option>' not in html
         assert '<option value="low">Low</option>' not in html
+
+    @pytest.mark.unit
+    def test_admin_dashboard_has_live_refresh(self, client: TestClient):
+        """Test dashboard periodically refreshes queue and lead data."""
+        response = client.get("/admin")
+        html = response.text
+
+        assert "REFRESH_INTERVAL_MS = 30000" in html
+        assert "window.setInterval(refreshData, REFRESH_INTERVAL_MS)" in html
 
     @pytest.mark.unit
     def test_admin_dashboard_does_not_embed_secrets(self, client: TestClient):

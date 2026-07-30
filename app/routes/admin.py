@@ -8,285 +8,395 @@ router = APIRouter(tags=["admin"])
 
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard() -> str:
-    """Serve a static admin dashboard backed by protected JSON APIs."""
+    """Serve a static self-contained dashboard backed by protected JSON APIs."""
     return """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LeadTriage Admin</title>
+    <title>LeadTriage Admin Dashboard</title>
     <style>
         :root {
             color-scheme: light;
-            --bg: #f4f6f8;
-            --panel: #ffffff;
-            --border: #d9e0e7;
-            --text: #17202a;
-            --muted: #667085;
-            --accent: #2563eb;
-            --accent-dark: #1d4ed8;
-            --danger: #b42318;
-            --warning: #b54708;
-            --success: #067647;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            --bg: #f1f5f9;
+            --surface: #ffffff;
+            --surface-muted: #f8fafc;
+            --border: #dbe3ef;
+            --text: #0f172a;
+            --muted: #64748b;
+            --blue: #2563eb;
+            --blue-dark: #1d4ed8;
+            --amber: #b45309;
+            --rose: #be123c;
+            --emerald: #047857;
+            --sky: #0369a1;
         }
-        * { box-sizing: border-box; }
+
+        * {
+            box-sizing: border-box;
+        }
+
         body {
-            margin: 0;
             min-height: 100vh;
+            margin: 0;
             background: var(--bg);
             color: var(--text);
-            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-                "Segoe UI", sans-serif;
+            font-size: 14px;
+            letter-spacing: 0;
         }
-        button, input, select { font: inherit; }
-        .shell {
-            width: min(1180px, calc(100% - 32px));
+
+        main {
+            width: min(100%, 1280px);
             margin: 0 auto;
-            padding: 28px 0 40px;
+            padding: 24px 20px;
         }
-        .topbar {
+
+        .toolbar,
+        .leads-panel,
+        .metric-card {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--surface);
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+        }
+
+        .toolbar {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 18px;
+            gap: 16px;
+            margin-bottom: 18px;
             padding: 18px;
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 8px;
         }
-        h1 {
+
+        h1,
+        h2,
+        p {
             margin: 0;
-            font-size: 1.45rem;
+        }
+
+        h1 {
+            font-size: 26px;
             line-height: 1.2;
+            font-weight: 700;
         }
-        .subtitle {
-            margin: 6px 0 0;
+
+        h2 {
+            font-size: 18px;
+            line-height: 1.3;
+            font-weight: 700;
+        }
+
+        .subtitle,
+        .status-line,
+        .metric-label {
             color: var(--muted);
-            font-size: 0.92rem;
         }
-        .controls {
+
+        .subtitle {
+            margin-top: 4px;
+        }
+
+        .status-line {
+            margin-top: 4px;
+        }
+
+        .status-line.error {
+            color: var(--rose);
+        }
+
+        .controls,
+        .filters {
             display: flex;
             align-items: center;
             gap: 10px;
-            flex-wrap: wrap;
-            justify-content: flex-end;
         }
-        .token-input {
-            width: min(320px, 100%);
+
+        input,
+        select,
+        button {
             height: 40px;
-            border: 1px solid var(--border);
             border-radius: 6px;
-            padding: 0 12px;
-            background: #fff;
+            font: inherit;
         }
-        .button {
-            height: 40px;
-            border: 0;
-            border-radius: 6px;
-            padding: 0 14px;
-            cursor: pointer;
-            font-weight: 650;
-        }
-        .button.primary {
-            color: #fff;
-            background: var(--accent);
-        }
-        .button.primary:hover { background: var(--accent-dark); }
-        .button.secondary {
+
+        input,
+        select {
+            border: 1px solid #cbd5e1;
+            background: #ffffff;
             color: var(--text);
-            background: #e7edf3;
+            outline: none;
+            padding: 0 12px;
         }
-        .grid {
+
+        input:focus,
+        select:focus,
+        button:focus-visible {
+            outline: 2px solid var(--blue);
+            outline-offset: 2px;
+        }
+
+        #adminToken {
+            width: min(360px, 100%);
+        }
+
+        button {
+            border: 0;
+            cursor: pointer;
+            font-weight: 700;
+            padding: 0 16px;
+        }
+
+        .button-primary {
+            background: var(--blue);
+            color: #ffffff;
+        }
+
+        .button-primary:hover {
+            background: var(--blue-dark);
+        }
+
+        .button-secondary {
+            background: #e2e8f0;
+            color: var(--text);
+        }
+
+        .button-secondary:hover {
+            background: #cbd5e1;
+        }
+
+        .metrics-grid {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 14px;
-            margin: 18px 0;
+            margin-bottom: 18px;
         }
-        .metric {
-            min-height: 104px;
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 16px;
+
+        .metric-card {
+            padding: 18px;
         }
+
         .metric-label {
-            color: var(--muted);
-            font-size: 0.86rem;
-            font-weight: 650;
+            font-weight: 700;
         }
+
         .metric-value {
-            margin-top: 10px;
-            font-size: 2rem;
+            margin-top: 12px;
+            font-size: 34px;
+            line-height: 1;
             font-weight: 800;
         }
-        .metric-value.pending { color: var(--accent); }
-        .metric-value.backoff { color: var(--warning); }
-        .metric-value.exhausted { color: var(--danger); }
-        .metric-value.neutral { color: #344054; }
-        .panel {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 8px;
+
+        .metric-value.pending {
+            color: var(--blue);
+        }
+
+        .metric-value.backoff {
+            color: var(--amber);
+        }
+
+        .metric-value.exhausted {
+            color: var(--rose);
+        }
+
+        .metric-value.max-attempts {
+            color: #334155;
+        }
+
+        .leads-panel {
             overflow: hidden;
         }
-        .panel-header {
+
+        .leads-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 14px;
-            padding: 16px 18px;
+            gap: 16px;
             border-bottom: 1px solid var(--border);
+            padding: 16px 18px;
         }
-        .panel-title {
-            margin: 0;
-            font-size: 1.05rem;
+
+        .table-wrap {
+            overflow-x: auto;
         }
-        .filters {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            justify-content: flex-end;
-        }
-        .filters select {
-            height: 38px;
-            min-width: 150px;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            background: #fff;
-            padding: 0 10px;
-        }
-        .status-line {
-            min-height: 28px;
-            padding: 10px 18px 0;
-            color: var(--muted);
-            font-size: 0.9rem;
-        }
-        .status-line.error { color: var(--danger); }
-        .table-wrap { overflow-x: auto; }
+
         table {
             width: 100%;
-            min-width: 820px;
+            min-width: 900px;
             border-collapse: collapse;
-        }
-        th, td {
-            padding: 12px 18px;
             text-align: left;
-            vertical-align: top;
-            border-bottom: 1px solid var(--border);
         }
-        th {
-            background: #f8fafc;
+
+        thead {
+            background: var(--surface-muted);
             color: var(--muted);
-            font-size: 0.75rem;
-            letter-spacing: 0.04em;
+            font-size: 12px;
+            font-weight: 800;
             text-transform: uppercase;
         }
-        td { font-size: 0.92rem; }
-        .customer { font-weight: 750; }
-        .contact {
-            color: var(--muted);
-            font-size: 0.82rem;
+
+        th,
+        td {
+            padding: 13px 18px;
+            vertical-align: top;
+        }
+
+        tbody tr {
+            border-top: 1px solid var(--border);
+        }
+
+        tbody tr:first-child {
+            border-top: 0;
+        }
+
+        tbody tr:hover {
+            background: var(--surface-muted);
+        }
+
+        .customer {
+            font-weight: 800;
+            color: var(--text);
+        }
+
+        .meta,
+        .timestamp {
             margin-top: 4px;
+            color: var(--muted);
+            font-size: 12px;
         }
-        .badge {
-            display: inline-flex;
-            align-items: center;
-            min-height: 24px;
-            padding: 3px 9px;
-            border-radius: 999px;
-            font-size: 0.78rem;
-            font-weight: 750;
-            background: #eef2f6;
-            color: #344054;
-        }
-        .badge.classified {
-            background: #dcfae6;
-            color: var(--success);
-        }
-        .badge.failed, .badge.hot {
-            background: #fee4e2;
-            color: var(--danger);
-        }
-        .badge.pending, .badge.warm {
-            background: #fef0c7;
-            color: var(--warning);
-        }
-        .badge.cold {
-            background: #dbeafe;
-            color: #1e40af;
-        }
+
         .summary {
-            max-width: 360px;
-            color: #475467;
-            line-height: 1.42;
+            max-width: 440px;
+            overflow: hidden;
+            color: #475569;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
-        .empty {
-            padding: 28px 18px;
+
+        .empty,
+        .load-error {
+            padding: 32px 18px;
             text-align: center;
             color: var(--muted);
         }
-        @media (max-width: 860px) {
-            .topbar, .panel-header {
+
+        .load-error {
+            color: var(--rose);
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 26px;
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        .badge.status-classified {
+            background: #d1fae5;
+            color: var(--emerald);
+        }
+
+        .badge.status-failed,
+        .badge.urgency-hot {
+            background: #ffe4e6;
+            color: var(--rose);
+        }
+
+        .badge.status-pending,
+        .badge.urgency-warm {
+            background: #fef3c7;
+            color: var(--amber);
+        }
+
+        .badge.urgency-cold {
+            background: #e0f2fe;
+            color: var(--sky);
+        }
+
+        .badge.urgency-empty {
+            background: #e2e8f0;
+            color: #475569;
+        }
+
+        @media (max-width: 900px) {
+            .toolbar,
+            .leads-header {
                 align-items: stretch;
                 flex-direction: column;
             }
-            .controls, .filters { justify-content: flex-start; }
-            .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        }
-        @media (max-width: 560px) {
-            .shell {
-                width: min(100% - 20px, 1180px);
-                padding-top: 12px;
+
+            .controls,
+            .filters {
+                align-items: stretch;
+                flex-direction: column;
             }
-            .grid { grid-template-columns: 1fr; }
-            .token-input { width: 100%; }
-            .button { flex: 1 1 120px; }
+
+            #adminToken,
+            button,
+            select {
+                width: 100%;
+            }
+
+            .metrics-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+
+        @media (max-width: 560px) {
+            main {
+                padding: 16px 12px;
+            }
+
+            .metrics-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    <main class="shell">
-        <section class="topbar">
+    <main>
+        <section class="toolbar">
             <div>
                 <h1>LeadTriage Admin</h1>
-                <p class="subtitle">Queue health and classified lead review.</p>
+                <p class="subtitle">Queue telemetry and classified lead review</p>
             </div>
             <div class="controls">
-                <input
-                    class="token-input"
-                    type="password"
-                    id="adminToken"
-                    autocomplete="off"
-                    placeholder="QUEUE_METRICS_TOKEN"
-                >
-                <button class="button primary" type="button" id="saveTokenButton">Save</button>
-                <button class="button secondary" type="button" id="refreshButton">Refresh</button>
+                <input id="adminToken" type="password" autocomplete="off" placeholder="Admin token">
+                <button id="saveTokenButton" type="button" class="button-primary">Save</button>
+                <button id="refreshButton" type="button" class="button-secondary">Refresh</button>
             </div>
         </section>
 
-        <section class="grid" aria-label="Queue metrics">
-            <div class="metric">
-                <div class="metric-label">Pending Leads</div>
+        <section class="metrics-grid" aria-label="Queue telemetry">
+            <div class="metric-card">
+                <div class="metric-label">Pending</div>
                 <div id="pendingCount" class="metric-value pending">-</div>
             </div>
-            <div class="metric">
+            <div class="metric-card">
                 <div class="metric-label">Backoff / Retry</div>
                 <div id="backoffCount" class="metric-value backoff">-</div>
             </div>
-            <div class="metric">
-                <div class="metric-label">Exhausted Leads</div>
+            <div class="metric-card">
+                <div class="metric-label">Exhausted</div>
                 <div id="exhaustedCount" class="metric-value exhausted">-</div>
             </div>
-            <div class="metric">
+            <div class="metric-card">
                 <div class="metric-label">Max Attempts</div>
-                <div id="maxAttempts" class="metric-value neutral">-</div>
+                <div id="maxAttempts" class="metric-value max-attempts">-</div>
             </div>
         </section>
 
-        <section class="panel">
-            <div class="panel-header">
-                <h2 class="panel-title">Leads</h2>
+        <section class="leads-panel">
+            <div class="leads-header">
+                <div>
+                    <h2>Leads</h2>
+                    <p id="statusLine" class="status-line">Ready</p>
+                </div>
                 <div class="filters">
                     <select id="statusFilter" aria-label="Filter by classification status">
                         <option value="">All statuses</option>
@@ -302,7 +412,6 @@ async def admin_dashboard() -> str:
                     </select>
                 </div>
             </div>
-            <div id="statusLine" class="status-line">Enter the admin token, then refresh.</div>
             <div class="table-wrap">
                 <table>
                     <thead>
@@ -325,6 +434,8 @@ async def admin_dashboard() -> str:
     </main>
 
     <script>
+        const TOKEN_STORAGE_KEY = "lead_triage_admin_token";
+        const REFRESH_INTERVAL_MS = 30000;
         const tokenInput = document.getElementById("adminToken");
         const saveTokenButton = document.getElementById("saveTokenButton");
         const refreshButton = document.getElementById("refreshButton");
@@ -334,12 +445,17 @@ async def admin_dashboard() -> str:
         const leadsTableBody = document.getElementById("leadsTableBody");
 
         function getToken() {
-            return localStorage.getItem("lead_triage_admin_token") || "";
+            return localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+        }
+
+        function getAuthHeaders() {
+            const token = getToken();
+            return token ? { "X-Admin-Token": token } : {};
         }
 
         function setStatus(message, isError = false) {
             statusLine.textContent = message;
-            statusLine.classList.toggle("error", isError);
+            statusLine.className = isError ? "status-line error" : "status-line";
         }
 
         function escapeHtml(value) {
@@ -351,13 +467,40 @@ async def admin_dashboard() -> str:
                 .replace(/'/g, "&#039;");
         }
 
-        function badgeClass(value) {
-            const normalized = String(value || "").toLowerCase();
-            return `badge ${escapeHtml(normalized)}`;
+        function statusBadgeClass(value) {
+            const status = String(value || "pending").toLowerCase();
+            if (status === "classified") {
+                return "badge status-classified";
+            }
+            if (status === "failed") {
+                return "badge status-failed";
+            }
+            return "badge status-pending";
+        }
+
+        function urgencyBadgeClass(value) {
+            const urgency = String(value || "").toLowerCase();
+            if (urgency === "hot") {
+                return "badge urgency-hot";
+            }
+            if (urgency === "warm") {
+                return "badge urgency-warm";
+            }
+            if (urgency === "cold") {
+                return "badge urgency-cold";
+            }
+            return "badge urgency-empty";
+        }
+
+        function clearQueueMetrics() {
+            document.getElementById("pendingCount").textContent = "-";
+            document.getElementById("backoffCount").textContent = "-";
+            document.getElementById("exhaustedCount").textContent = "-";
+            document.getElementById("maxAttempts").textContent = "-";
         }
 
         function saveToken() {
-            localStorage.setItem("lead_triage_admin_token", tokenInput.value.trim());
+            localStorage.setItem(TOKEN_STORAGE_KEY, tokenInput.value.trim());
             refreshData();
         }
 
@@ -366,16 +509,12 @@ async def admin_dashboard() -> str:
         }
 
         async function loadQueueMetrics() {
-            const token = getToken();
-            const headers = token ? { Authorization: `Bearer ${token}` } : {};
-
             try {
-                const response = await fetch("/health/queue", { headers });
+                const response = await fetch("/health/queue", {
+                    headers: getAuthHeaders()
+                });
                 if (!response.ok) {
-                    document.getElementById("pendingCount").textContent = "-";
-                    document.getElementById("backoffCount").textContent = "-";
-                    document.getElementById("exhaustedCount").textContent = "-";
-                    document.getElementById("maxAttempts").textContent = "-";
+                    clearQueueMetrics();
                     return;
                 }
 
@@ -385,15 +524,11 @@ async def admin_dashboard() -> str:
                 document.getElementById("exhaustedCount").textContent = data.exhausted_count ?? 0;
                 document.getElementById("maxAttempts").textContent = data.max_attempts ?? 0;
             } catch {
-                document.getElementById("pendingCount").textContent = "-";
-                document.getElementById("backoffCount").textContent = "-";
-                document.getElementById("exhaustedCount").textContent = "-";
-                document.getElementById("maxAttempts").textContent = "-";
+                clearQueueMetrics();
             }
         }
 
         async function loadLeads() {
-            const token = getToken();
             const params = new URLSearchParams({ limit: "50", offset: "0" });
             if (statusFilter.value) {
                 params.set("classification_status", statusFilter.value);
@@ -404,13 +539,13 @@ async def admin_dashboard() -> str:
 
             try {
                 const response = await fetch(`/api/leads?${params.toString()}`, {
-                    headers: token ? { "X-Admin-Token": token } : {}
+                    headers: getAuthHeaders()
                 });
 
                 if (!response.ok) {
                     leadsTableBody.innerHTML = `
                         <tr>
-                            <td colspan="5" class="empty">Unable to load leads. Status ${response.status}.</td>
+                            <td colspan="5" class="load-error">Unable to load leads. Status ${response.status}.</td>
                         </tr>
                     `;
                     setStatus("Lead load failed.", true);
@@ -433,23 +568,32 @@ async def admin_dashboard() -> str:
                 leadsTableBody.innerHTML = items.map((lead) => {
                     const contact = lead.customer_email || lead.customer_phone || "No contact";
                     const summary = lead.summary || lead.message || "";
+                    const createdAt = lead.created_at
+                        ? new Date(lead.created_at).toLocaleString()
+                        : "";
                     return `
                         <tr>
                             <td>
                                 <div class="customer">${escapeHtml(lead.customer_name || "Anonymous")}</div>
-                                <div class="contact">${escapeHtml(lead.source)} &middot; ${escapeHtml(contact)}</div>
+                                <div class="meta">${escapeHtml(lead.source)} &middot; ${escapeHtml(contact)}</div>
                             </td>
-                            <td><span class="${badgeClass(lead.classification_status)}">${escapeHtml(lead.classification_status)}</span></td>
-                            <td><span class="${badgeClass(lead.urgency)}">${escapeHtml(lead.urgency || "N/A")}</span></td>
-                            <td><div class="summary">${escapeHtml(summary)}</div></td>
-                            <td>${escapeHtml(new Date(lead.created_at).toLocaleString())}</td>
+                            <td>
+                                <span class="${statusBadgeClass(lead.classification_status)}">${escapeHtml(lead.classification_status)}</span>
+                            </td>
+                            <td>
+                                <span class="${urgencyBadgeClass(lead.urgency)}">${escapeHtml(lead.urgency || "N/A")}</span>
+                            </td>
+                            <td>
+                                <div class="summary">${escapeHtml(summary)}</div>
+                            </td>
+                            <td class="timestamp">${escapeHtml(createdAt)}</td>
                         </tr>
                     `;
                 }).join("");
             } catch {
                 leadsTableBody.innerHTML = `
                     <tr>
-                        <td colspan="5" class="empty">Unable to load leads.</td>
+                        <td colspan="5" class="load-error">Unable to load leads.</td>
                     </tr>
                 `;
                 setStatus("Lead load failed.", true);
@@ -463,9 +607,8 @@ async def admin_dashboard() -> str:
 
         window.addEventListener("load", () => {
             tokenInput.value = getToken();
-            if (tokenInput.value) {
-                refreshData();
-            }
+            refreshData();
+            window.setInterval(refreshData, REFRESH_INTERVAL_MS);
         });
     </script>
 </body>
