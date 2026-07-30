@@ -209,7 +209,7 @@ The daemon handles `SIGINT` and `SIGTERM` gracefully: an active batch is allowed
 
 ## Docker
 
-The Docker image uses the same application code for both services. `docker-compose.yml` starts:
+The Docker image uses Python 3.12 to match the project runtime constraint in `pyproject.toml`. The same application image is used for both services. `docker-compose.yml` starts:
 
 - `api`: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
 - `worker`: `python -m app.jobs.classification_daemon --worker-id docker-worker-1`
