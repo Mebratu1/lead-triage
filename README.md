@@ -1,6 +1,6 @@
 # LeadTriage
 
-LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classification API. The current implementation accepts unstructured lead inquiries, persists them to Supabase, and deduplicates repeat submissions before later AI classification work is added.
+LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classification API. The current implementation accepts unstructured lead inquiries, persists them to Supabase, deduplicates repeat submissions, and classifies pending leads through an isolated OpenAI-backed worker.
 
 ## Current Status
 
@@ -11,8 +11,10 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Lead request contract aligned
 - Lead persistence connected
 - Idempotency processing connected
-- AI classification not yet connected
-- Queue and CRM integrations not yet connected
+- AI classification contracts and OpenAI client connected
+- Manual classification runner connected
+- Autonomous classification daemon connected
+- CRM integrations not yet connected
 
 ## Runtime
 
@@ -85,7 +87,7 @@ Duplicate response:
 }
 ```
 
-The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a duplicate that returns an existing lead. It saves the lead with `classification_status = "pending"` and does not echo the full raw customer message. It does not call OpenAI, generate fake classification values, enqueue background work, or push to a CRM.
+The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a duplicate that returns an existing lead. It saves the lead with `classification_status = "pending"` and does not echo the full raw customer message. The API route does not call OpenAI, generate fake classification values, or push to a CRM; classification is handled separately by the worker jobs.
 
 ## Idempotency
 
@@ -106,7 +108,13 @@ Duplicate detection is scoped by `DEDUP_WINDOW_DAYS`. The service derives a UTC 
 
 ## Database
 
-The migration in `app/db/migrations/001_init_schema.sql` defines the baseline `leads` table shape. The non-destructive migration in `app/db/migrations/002_idempotent_lead_persistence.sql` upgrades older tables and adds windowed idempotency support. The compatibility migration in `app/db/migrations/003_relax_legacy_lead_required_columns.sql` relaxes required legacy customer fields that Milestone 3A intentionally does not populate.
+Apply migrations in order:
+
+1. `app/db/migrations/001_init_schema.sql` defines the baseline `leads` table shape.
+2. `app/db/migrations/002_idempotent_lead_persistence.sql` upgrades older tables and adds windowed idempotency support.
+3. `app/db/migrations/003_relax_legacy_lead_required_columns.sql` relaxes required legacy customer fields that intake intentionally does not populate.
+4. `app/db/migrations/004_classification_tracking_columns.sql` adds classified output, error, timestamp, and model tracking columns.
+5. `app/db/migrations/005_classification_claim_retry.sql` adds worker claim ownership, attempt counts, retry backoff, indexes, and the atomic claim RPC.
 
 - `id`
 - `idempotency_key`
@@ -121,6 +129,14 @@ The migration in `app/db/migrations/001_init_schema.sql` defines the baseline `l
 - `lead_score`
 - `ai_summary`
 - `classification_status`
+- `classification_error`
+- `classified_at`
+- `classification_model`
+- `classification_claimed_at`
+- `classification_claimed_by`
+- `classification_attempt_count`
+- `last_classification_error`
+- `next_classification_attempt_at`
 - `created_at`
 
 The request field `message` is stored as `raw_message`.
@@ -161,6 +177,36 @@ Copy-Item .env.example .env
 
 Never commit `.env` or service-role keys.
 
+## Classification Jobs
+
+The API stores new leads as `pending`. Classification is performed out of band so lead intake remains fast and predictable.
+
+Dry-run the manual batch runner without calling OpenAI or writing classification results:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.classify_pending_leads --limit 10 --dry-run
+```
+
+Run one manual batch:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.classify_pending_leads --limit 10 --worker-id manual-local-1
+```
+
+Run one daemon iteration and exit:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.classification_daemon --run-once --worker-id daemon-local-1
+```
+
+Run the long-lived daemon:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.jobs.classification_daemon --limit 10 --sleep-seconds 30 --worker-id daemon-local-1
+```
+
+The daemon handles `SIGINT` and `SIGTERM` gracefully: an active batch is allowed to finish before the process exits. Standard logs include counts, worker IDs, model names, retry/backoff events, and error types, but never full raw customer messages.
+
 ## Development Verification
 
 ```powershell
@@ -198,8 +244,8 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Typed classified lead output contracts
-2. OpenAI-compatible structured classification
-3. Persistence of classified fields
-4. Queue or background processing if classification becomes slow
-5. Vercel deployment configuration
+1. Deployment/runbook hardening for the classification daemon
+2. Metrics and alerting for repeated worker failures, retry backlog, and exhausted attempts
+3. Read endpoints or admin views for classified leads
+4. CRM integration from classified lead records
+5. Hosted deployment configuration

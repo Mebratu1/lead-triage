@@ -3,7 +3,10 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 
 
 class Settings(BaseSettings):
@@ -32,7 +35,7 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str
     openai_base_url: str = "https://api.openai.com/v1"
-    openai_model: str = "gpt-4-turbo-preview"
+    openai_model: str = DEFAULT_OPENAI_MODEL
     ai_request_timeout_seconds: int = 20
 
     # API
@@ -50,6 +53,15 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-key-change-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expiration_hours: int = 24
+
+    @field_validator("openai_model")
+    @classmethod
+    def openai_model_must_not_be_blank(cls, value: str) -> str:
+        """Avoid sending empty model names to the OpenAI API."""
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("OPENAI_MODEL must not be blank")
+        return cleaned
 
 
 @lru_cache()
