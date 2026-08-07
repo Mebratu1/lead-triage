@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from ipaddress import ip_network
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -15,6 +16,25 @@ INSECURE_JWT_SECRETS = {
     "your-secret-key-change-in-production",
     "your-secret-key-here",
 }
+HUBSPOT_CUSTOM_PROPERTY_SOURCES = {
+    "id",
+    "source",
+    "name",
+    "email",
+    "phone",
+    "message",
+    "urgency",
+    "summary",
+    "created_at",
+}
+HUBSPOT_RESERVED_PROPERTIES = {
+    "email",
+    "firstname",
+    "lastname",
+    "phone",
+    "lifecyclestage",
+}
+HUBSPOT_PROPERTY_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
 
 
 class Settings(BaseSettings):
@@ -53,9 +73,12 @@ class Settings(BaseSettings):
     trusted_proxy_cidrs: list[str] = []
 
     # Outbound CRM integration
+    crm_provider: Literal["signed_webhook", "hubspot"] = "signed_webhook"
     crm_webhook_url: str | None = None
     crm_webhook_secret: str | None = None
     crm_webhook_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    hubspot_access_token: str | None = None
+    hubspot_property_map: dict[str, str] = Field(default_factory=dict)
     crm_retry_base_seconds: int = Field(default=60, ge=1)
     crm_retry_max_seconds: int = Field(default=3600, ge=1)
     crm_retry_max_attempts: int = Field(default=5, ge=1, le=100)
@@ -134,6 +157,7 @@ class Settings(BaseSettings):
         "queue_metrics_token",
         "crm_webhook_url",
         "crm_webhook_secret",
+        "hubspot_access_token",
         "alert_webhook_url",
         "alert_webhook_secret",
     )
@@ -166,6 +190,36 @@ class Settings(BaseSettings):
             raise ValueError("CRM_WEBHOOK_SECRET must be at least 32 characters")
         return value
 
+    @field_validator("hubspot_property_map")
+    @classmethod
+    def hubspot_property_map_must_be_safe(
+        cls, value: dict[str, str]
+    ) -> dict[str, str]:
+        """Validate explicit mappings to existing HubSpot custom properties."""
+        normalized: dict[str, str] = {}
+        used_properties: set[str] = set()
+        for source, property_name in value.items():
+            if source not in HUBSPOT_CUSTOM_PROPERTY_SOURCES:
+                raise ValueError(
+                    "HUBSPOT_PROPERTY_MAP contains an unsupported lead field"
+                )
+            cleaned_property_name = property_name.strip()
+            if not HUBSPOT_PROPERTY_NAME_PATTERN.fullmatch(cleaned_property_name):
+                raise ValueError(
+                    "HUBSPOT_PROPERTY_MAP values must be HubSpot internal property names"
+                )
+            if cleaned_property_name in HUBSPOT_RESERVED_PROPERTIES:
+                raise ValueError(
+                    "HUBSPOT_PROPERTY_MAP must not overwrite standard contact properties"
+                )
+            if cleaned_property_name in used_properties:
+                raise ValueError(
+                    "HUBSPOT_PROPERTY_MAP values must be unique"
+                )
+            normalized[source] = cleaned_property_name
+            used_properties.add(cleaned_property_name)
+        return normalized
+
     @field_validator("alert_webhook_url")
     @classmethod
     def alert_webhook_url_must_use_https(cls, value: str | None) -> str | None:
@@ -196,10 +250,25 @@ class Settings(BaseSettings):
                 "ADMIN_TOKEN must be distinct from QUEUE_METRICS_TOKEN"
             )
 
-        if (self.crm_webhook_url is None) != (self.crm_webhook_secret is None):
-            raise ValueError(
-                "CRM_WEBHOOK_URL and CRM_WEBHOOK_SECRET must be configured together"
-            )
+        if self.crm_provider == "signed_webhook":
+            if (self.crm_webhook_url is None) != (self.crm_webhook_secret is None):
+                raise ValueError(
+                    "CRM_WEBHOOK_URL and CRM_WEBHOOK_SECRET must be configured together"
+                )
+            if self.hubspot_access_token is not None or self.hubspot_property_map:
+                raise ValueError(
+                    "HubSpot settings require CRM_PROVIDER=hubspot"
+                )
+        else:
+            if self.hubspot_access_token is None:
+                raise ValueError(
+                    "HUBSPOT_ACCESS_TOKEN is required when CRM_PROVIDER=hubspot"
+                )
+            if self.crm_webhook_url is not None or self.crm_webhook_secret is not None:
+                raise ValueError(
+                    "CRM_WEBHOOK_URL and CRM_WEBHOOK_SECRET must be unset when "
+                    "CRM_PROVIDER=hubspot"
+                )
 
         if self.crm_retry_max_seconds < self.crm_retry_base_seconds:
             raise ValueError(

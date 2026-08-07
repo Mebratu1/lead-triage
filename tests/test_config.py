@@ -166,6 +166,81 @@ class TestRuntimeSettings:
             )
 
     @pytest.mark.unit
+    def test_hubspot_requires_an_explicit_access_token(self):
+        """Test selecting HubSpot fails closed until a token is supplied."""
+        with pytest.raises(ValidationError, match="HUBSPOT_ACCESS_TOKEN is required"):
+            build_settings(crm_provider="hubspot")
+
+    @pytest.mark.unit
+    def test_hubspot_rejects_webhook_settings(self):
+        """Test provider selection cannot leave two outbound paths configured."""
+        with pytest.raises(ValidationError, match="must be unset"):
+            build_settings(
+                crm_provider="hubspot",
+                hubspot_access_token="hubspot-private-app-token",
+                crm_webhook_url="https://crm.example.test/hook",
+                crm_webhook_secret="crm-test-signing-secret-with-enough-entropy",
+            )
+
+    @pytest.mark.unit
+    def test_hubspot_accepts_explicit_custom_property_mapping(self):
+        """Test only configured HubSpot custom fields supplement standard mappings."""
+        settings = build_settings(
+            crm_provider="hubspot",
+            hubspot_access_token="hubspot-private-app-token",
+            hubspot_property_map={"source": "lead_source", "urgency": "lead_urgency"},
+        )
+
+        assert settings.hubspot_property_map == {
+            "source": "lead_source",
+            "urgency": "lead_urgency",
+        }
+
+    @pytest.mark.unit
+    def test_hubspot_property_map_loads_from_environment_settings(self, monkeypatch):
+        """Test the JSON environment setting is parsed and normalized by Pydantic."""
+        monkeypatch.setenv("CRM_PROVIDER", "hubspot")
+        monkeypatch.setenv("HUBSPOT_ACCESS_TOKEN", "hubspot-private-app-token")
+        monkeypatch.setenv(
+            "HUBSPOT_PROPERTY_MAP",
+            '{"source":" lead_source ","urgency":"lead_urgency"}',
+        )
+
+        settings = Settings(
+            _env_file=None,
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="test-service-role-key",
+            openai_api_key="test-openai-key",
+        )
+
+        assert settings.hubspot_property_map == {
+            "source": "lead_source",
+            "urgency": "lead_urgency",
+        }
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "property_map, message",
+        [
+            ({"unknown": "lead_source"}, "unsupported lead field"),
+            ({"source": "email"}, "must not overwrite"),
+            ({"source": "LeadSource"}, "internal property names"),
+            (
+                {"source": "lead_source", "urgency": "lead_source"},
+                "must be unique",
+            ),
+        ],
+    )
+    def test_hubspot_rejects_unsafe_custom_property_maps(self, property_map, message):
+        """Test custom mappings cannot target unknown or conflicting HubSpot fields."""
+        with pytest.raises(ValidationError, match=message):
+            build_settings(
+                crm_provider="hubspot",
+                hubspot_access_token="hubspot-private-app-token",
+                hubspot_property_map=property_map,
+            )
+
+    @pytest.mark.unit
     def test_alert_webhook_requires_https_and_complete_configuration(self):
         """Test alert delivery cannot be partially or insecurely configured."""
         with pytest.raises(ValidationError, match="must be configured together"):

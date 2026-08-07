@@ -17,7 +17,7 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Queue health metrics connected
 - Admin lead read API foundation connected
 - Browser admin dashboard interactions and richer lead detail views connected
-- Signed CRM webhook delivery, concurrent retry processing, and filtered CSV export
+- Signed CRM webhook delivery, opt-in HubSpot contact mapping, concurrent retry processing, and filtered CSV export
 - Signed worker alert routing for stalled queues, high error rates, and repeated batch crashes
 - Split admin/monitoring credentials, public intake limits, safe retry visibility, and sanitized health logs
 
@@ -159,9 +159,9 @@ Read responses intentionally expose only the admin-safe fields needed for review
 
 `GET /api/leads/export/csv` accepts the same filters as the lead list endpoint plus bounded `limit` and `offset` controls. It streams `classified_leads_export.csv` with only `ID`, `Source`, `Customer Name`, `Customer Email`, `Customer Phone`, `Status`, `Urgency`, `Summary`, and `Created At`. Exported cells are escaped when they look like spreadsheet formulas.
 
-`POST /api/leads/{id}/sync` sends classified leads to the configured HTTPS CRM webhook. The endpoint fails closed with `503` and does not mutate integration state when `CRM_WEBHOOK_URL` or `CRM_WEBHOOK_SECRET` is absent. Successful `2xx` responses mark the lead synced. HTTP `429`, HTTP `5xx`, and transport timeouts schedule a retry; other non-`2xx` responses remain failed without a retry timestamp. Stored and returned errors are sanitized and never contain the destination response body.
+`POST /api/leads/{id}/sync` sends classified leads through the configured CRM provider. The default `signed_webhook` provider fails closed with `503` and does not mutate integration state when `CRM_WEBHOOK_URL` or `CRM_WEBHOOK_SECRET` is absent. Successful `2xx` responses mark the lead synced. HTTP `429`, HTTP `5xx`, and transport timeouts schedule a retry; other non-`2xx` responses remain failed without a retry timestamp. Stored and returned errors are sanitized and never contain the destination response body.
 
-CRM requests use canonical JSON and these headers:
+The default signed-webhook provider uses canonical JSON and these headers:
 
 - `X-LeadTriage-Event: lead.sync`
 - `X-LeadTriage-Timestamp: <unix-seconds>`
@@ -169,6 +169,12 @@ CRM requests use canonical JSON and these headers:
 - `Idempotency-Key: <lead-id>`
 
 The signature input is the UTF-8 byte sequence `<timestamp>.<raw-request-body>`. Receivers should reject stale timestamps, compare signatures with a constant-time function, and deduplicate on the lead-ID idempotency key.
+
+### HubSpot Contact Mapping
+
+Set `CRM_PROVIDER=hubspot` and provide a HubSpot private-app `HUBSPOT_ACCESS_TOKEN` with `crm.objects.contacts.read` and `crm.objects.contacts.write` scopes. The adapter looks up the contact by email, updates it when found, and creates it when absent. This makes an email address mandatory for HubSpot sync and avoids creating duplicate contacts during retries or manual re-syncs.
+
+The default mapping writes only HubSpot standard contact properties: `email`, `firstname`, `lastname`, `phone`, and `lifecyclestage=lead` on new contacts. Existing contacts keep their lifecycle stage so a successful customer or opportunity is never moved backward to a lead. To map lead-specific fields, create the HubSpot custom contact properties first, then set `HUBSPOT_PROPERTY_MAP` to a JSON object mapping one of `id`, `source`, `name`, `email`, `phone`, `message`, `urgency`, `summary`, or `created_at` to each custom property's internal name. No lead message, AI summary, urgency, or source data is sent to HubSpot unless explicitly mapped. The adapter uses HubSpot's [Contacts API](https://developers.hubspot.com/docs/api-reference/latest/crm/objects/contacts/guide); the application never logs the access token or HubSpot response body.
 
 ### Browser Admin Dashboard
 
@@ -446,7 +452,10 @@ Feature-gated worker variables:
 | --- | --- |
 | `CRM_WEBHOOK_URL` | absolute HTTPS lead webhook; sync fails closed when absent |
 | `CRM_WEBHOOK_SECRET` | CRM-only HMAC secret with at least 32 characters |
-| `CRM_WEBHOOK_TIMEOUT_SECONDS` | strict connect/read/write/pool timeout, default `5` |
+| `CRM_WEBHOOK_TIMEOUT_SECONDS` | strict CRM provider connect/read/write/pool timeout, default `5` |
+| `CRM_PROVIDER` | `signed_webhook` (default) or `hubspot` |
+| `HUBSPOT_ACCESS_TOKEN` | HubSpot private-app token; required only when `CRM_PROVIDER=hubspot` |
+| `HUBSPOT_PROPERTY_MAP` | JSON map of explicitly provisioned HubSpot custom contact properties; default `{}` |
 | `CRM_RETRY_BASE_SECONDS` | initial scheduled delay, default `60` |
 | `CRM_RETRY_MAX_SECONDS` | exponential-backoff cap, default `3600` |
 | `CRM_RETRY_MAX_ATTEMPTS` | worker retry limit, default `5` |
@@ -669,6 +678,6 @@ Current API tests are synchronous and use `TestClient`. Database behavior is tes
 
 Next implementation work should add, in order:
 
-1. Provider-specific CRM field mapping beyond the generic signed webhook contract
+1. Additional provider-specific CRM adapters and mappings beyond HubSpot contacts
 2. Persistent incident state or external supervision for crash detection across process restarts
 3. Deployment automation and external runtime supervision

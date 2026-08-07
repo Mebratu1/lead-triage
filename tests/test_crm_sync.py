@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID
 
 import httpx
@@ -17,7 +18,9 @@ from app.models.schemas import LeadPublicResponse
 from app.services.crm_sync import (
     CrmDeliveryPermanentError,
     CrmDeliveryRetryableError,
+    HubSpotCrmDispatcher,
     SignedWebhookCrmDispatcher,
+    configured_crm_dispatcher,
 )
 
 WEBHOOK_SECRET = "crm-test-signing-secret-with-32-bytes"
@@ -137,3 +140,213 @@ class TestSignedWebhookCrmDispatcher:
 
         assert str(raised.value) == "crm_transport_failed"
         assert "customer data" not in str(raised.value)
+
+
+async def deliver_hubspot_with_handler(
+    handler,
+    *,
+    property_map: dict[str, str] | None = None,
+    lead: LeadPublicResponse | None = None,
+) -> None:
+    """Deliver one lead through a transport-isolated HubSpot adapter."""
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        dispatcher = HubSpotCrmDispatcher(
+            access_token="hubspot-private-app-token",
+            timeout_seconds=2.5,
+            property_map=property_map,
+            client=client,
+        )
+        await dispatcher.sync_lead(lead or lead_response())
+
+
+class TestHubSpotCrmDispatcher:
+    """HubSpot contact mapping, upsert behavior, and failure classification tests."""
+
+    @pytest.mark.unit
+    def test_creates_contact_with_standard_and_explicit_custom_properties(self):
+        """Test a missing email contact is created with only configured custom fields."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(404)
+            return httpx.Response(201, json={"id": "123"})
+
+        asyncio.run(
+            deliver_hubspot_with_handler(
+                handler,
+                property_map={
+                    "id": "lead_triage_id",
+                    "source": "lead_source",
+                    "urgency": "lead_urgency",
+                    "summary": "lead_summary",
+                },
+            )
+        )
+
+        assert [request.method for request in requests] == ["GET", "POST"]
+        assert requests[0].url.params["idProperty"] == "email"
+        assert requests[0].headers["Authorization"] == "Bearer hubspot-private-app-token"
+        payload = json.loads(requests[1].content)
+        assert payload == {
+            "properties": {
+                "email": "maria@example.com",
+                "firstname": "Maria",
+                "lastname": "Customer",
+                "phone": "301-555-0144",
+                "lifecyclestage": "lead",
+                "lead_triage_id": "11111111-1111-4111-8111-111111111111",
+                "lead_source": "website",
+                "lead_urgency": "hot",
+                "lead_summary": "Customer needs plumbing help.",
+            }
+        }
+        assert "message" not in json.dumps(payload)
+        assert requests[1].extensions["timeout"] == {
+            "connect": 2.5,
+            "read": 2.5,
+            "write": 2.5,
+            "pool": 2.5,
+        }
+
+    @pytest.mark.unit
+    def test_updates_existing_contact_by_email(self):
+        """Test a known email is updated instead of creating a duplicate contact."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"id": "hubspot-contact-123"})
+            return httpx.Response(200)
+
+        asyncio.run(deliver_hubspot_with_handler(handler))
+
+        assert [request.method for request in requests] == ["GET", "PATCH"]
+        assert requests[1].url.path.endswith("/hubspot-contact-123")
+        update_payload = json.loads(requests[1].content)
+        assert update_payload["properties"]["email"] == "maria@example.com"
+        assert "lifecyclestage" not in update_payload["properties"]
+
+    @pytest.mark.unit
+    def test_normalizes_email_once_for_lookup_and_all_mapped_properties(self):
+        """Test one normalized email value drives lookup and the outbound payload."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(404)
+            return httpx.Response(201, json={"id": "123"})
+
+        lead = lead_response().model_copy(
+            update={"customer_email": "  maria@example.com  "}
+        )
+        asyncio.run(
+            deliver_hubspot_with_handler(
+                handler,
+                property_map={"email": "lead_email"},
+                lead=lead,
+            )
+        )
+
+        assert str(requests[0].url).startswith(
+            "https://api.hubapi.com/crm/objects/2026-03/contacts/"
+            "maria%40example.com"
+        )
+        payload = json.loads(requests[1].content)["properties"]
+        assert payload["email"] == "maria@example.com"
+        assert payload["lead_email"] == "maria@example.com"
+
+    @pytest.mark.unit
+    def test_create_conflict_refetches_and_updates_contact(self):
+        """Test a create race resolves by refetching the email contact and updating it."""
+        requests: list[httpx.Request] = []
+        get_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal get_count
+            requests.append(request)
+            if request.method == "GET":
+                get_count += 1
+                if get_count == 1:
+                    return httpx.Response(404)
+                return httpx.Response(200, json={"id": "hubspot-contact-456"})
+            if request.method == "POST":
+                return httpx.Response(409)
+            return httpx.Response(200)
+
+        asyncio.run(deliver_hubspot_with_handler(handler))
+
+        assert [request.method for request in requests] == [
+            "GET",
+            "POST",
+            "GET",
+            "PATCH",
+        ]
+        assert requests[-1].url.path.endswith("/hubspot-contact-456")
+
+    @pytest.mark.unit
+    def test_missing_email_requires_manual_intervention_without_a_request(self):
+        """Test HubSpot never creates an unaddressable contact without an email."""
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(500)
+
+        lead = lead_response().model_copy(update={"customer_email": None})
+        with pytest.raises(CrmDeliveryPermanentError, match="hubspot_email_required"):
+            asyncio.run(deliver_hubspot_with_handler(handler, lead=lead))
+
+        assert call_count == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("status_code", [429, 500, 503])
+    def test_transient_hubspot_responses_are_retryable(self, status_code: int):
+        """Test retry-safe CRM status classification is shared by the HubSpot adapter."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code, text="private upstream response")
+
+        with pytest.raises(CrmDeliveryRetryableError) as raised:
+            asyncio.run(deliver_hubspot_with_handler(handler))
+
+        assert raised.value.status_code == status_code
+        assert "private upstream response" not in str(raised.value)
+
+    @pytest.mark.unit
+    def test_hubspot_transport_errors_are_retryable_without_secret_leaks(self):
+        """Test transport errors do not leak an upstream token or customer details."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout(
+                "hubspot-private-app-token maria@example.com",
+                request=request,
+            )
+
+        with pytest.raises(CrmDeliveryRetryableError) as raised:
+            asyncio.run(deliver_hubspot_with_handler(handler))
+
+        assert str(raised.value) == "hubspot_transport_failed"
+        assert "hubspot-private-app-token" not in str(raised.value)
+
+    @pytest.mark.unit
+    def test_configured_dispatcher_selects_hubspot_only_when_opted_in(
+        self, monkeypatch
+    ):
+        """Test the configured sync boundary uses HubSpot only after explicit selection."""
+        monkeypatch.setattr(
+            "app.services.crm_sync.settings",
+            SimpleNamespace(
+                crm_provider="hubspot",
+                hubspot_access_token="hubspot-private-app-token",
+                crm_webhook_timeout_seconds=2.5,
+                hubspot_property_map={"source": "lead_source"},
+            ),
+        )
+
+        dispatcher = configured_crm_dispatcher()
+
+        assert isinstance(dispatcher, HubSpotCrmDispatcher)
+        assert dispatcher.property_map == {"source": "lead_source"}
