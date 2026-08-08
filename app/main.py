@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db.client import SupabaseClient
+from app.middleware import RequestBodySizeLimitMiddleware
 from app.api.routes import leads
 from app.routes import admin, health
 from app.services.rate_limiter import (
@@ -49,7 +50,11 @@ def create_app() -> FastAPI:
         settings.trusted_proxy_cidrs
     )
 
-    # CORS Middleware
+    app.add_middleware(
+        RequestBodySizeLimitMiddleware,
+        max_bytes=settings.request_max_bytes,
+    )
+    # CORS stays outermost so browser clients receive CORS headers on a 413.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,

@@ -13,6 +13,7 @@ from uuid import UUID
 import pytest
 
 from app.db.client import get_db
+from app.config import settings
 from app.models.lead import LeadCreateRequest
 from app.services.lead_persistence import (
     deduplication_bucket_for,
@@ -671,6 +672,24 @@ class TestLeadPersistenceContract:
         )
 
         assert response.status_code == 422
+
+    @pytest.mark.unit
+    def test_create_lead_rejects_body_over_configured_limit(
+        self,
+        client: TestClient,
+    ):
+        """Test the configured raw request-body limit returns 413 before parsing."""
+        body = b'{"message":"' + (b"a" * settings.request_max_bytes) + b'"}'
+
+        response = client.post(
+            "/api/leads",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert len(body) > settings.request_max_bytes
+        assert response.status_code == 413
+        assert response.json() == {"detail": "Request body too large"}
 
     @pytest.mark.unit
     def test_create_lead_rate_limit_returns_429_without_database_write(

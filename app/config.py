@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     api_title: str = "LeadTriage API"
     api_version: str = "0.1.0"
     log_level: str = "INFO"
-    request_max_bytes: int = 32768
+    request_max_bytes: int = Field(default=32768, ge=1)
 
     # Supabase
     supabase_url: str

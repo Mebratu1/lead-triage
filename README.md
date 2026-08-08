@@ -117,6 +117,11 @@ The endpoint returns `201 Created` for a newly saved lead and `200 OK` for a dup
 
 Public intake is limited per connecting client by `RATE_LIMIT_PER_MINUTE` and `RATE_LIMIT_PER_HOUR`. Rejected requests return `429 Too Many Requests` with `Retry-After`. `X-Forwarded-For` is considered only when the immediate peer belongs to `TRUSTED_PROXY_CIDRS`; the nearest untrusted hop is selected from right to left, and malformed chains fall back to the socket peer. Configure only proxy ranges that sanitize or append forwarding headers correctly. The built-in limiter is process-local, so multi-instance production deployments must also enforce a shared limit at the edge or through a shared store such as Redis.
 
+### Known Hardening Gaps
+
+- Public intake does not currently use CAPTCHA or other bot-protection challenges.
+- The built-in intake rate limiter is process-local rather than shared across API instances. This becomes a material limitation when the API is scaled beyond one instance; use an edge-enforced or shared-store limit at that point.
+
 ### Admin Lead Read API
 
 ```http
