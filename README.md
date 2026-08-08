@@ -323,6 +323,16 @@ The daemon handles `SIGINT` and `SIGTERM` gracefully: an active batch is allowed
 
 The CRM retry daemon atomically claims classified leads whose `integration_next_attempt_at` is due. `FOR UPDATE SKIP LOCKED`, claim ownership, and stale-claim recovery prevent two workers from owning the same database item. The external receiver must still honor `Idempotency-Key` because a network response can be lost after the receiver commits.
 
+### Current Production Scope
+
+CRM auto-sync is intentionally **not active** in the current production deployment. No CRM provider or signed-webhook destination has been selected, so no CRM retry worker is deployed. This is a deliberate scope decision, not a pipeline defect.
+
+The core pipeline remains fully operational without CRM delivery:
+
+`intake API -> Supabase persistence -> classification worker -> admin dashboard`
+
+Deploy the CRM retry worker only after a provider decision and its corresponding configuration are in place. Until then, leads remain available for manual review and handling in the admin dashboard.
+
 Run one retry iteration:
 
 ```powershell
@@ -627,17 +637,17 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 
 ### Deployment Checklist
 
-1. Apply Supabase migrations `001` through `007` in order.
+1. Apply Supabase migrations `001` through `008` in order.
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Confirm `OPENAI_API_KEY` is available only to server containers.
 4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
 5. Set `ADMIN_TOKEN`, `QUEUE_METRICS_TOKEN`, and `JWT_SECRET` to generated, distinct values.
 6. Run `docker compose config --quiet` locally before deploying.
-7. Build and start the API, classification worker, and CRM sync worker from the same image.
+7. Build and start the API and classification worker from the same image. Start the CRM sync worker only after a CRM provider or signed-webhook destination has been selected and configured.
 8. Verify `GET /health`, `GET /health/database`, and protected `GET /health/queue`.
 9. Submit one test lead and confirm the worker processes it.
-10. Confirm both worker logs show batch counts, queue counters, retry/backoff visibility, and no raw customer message text.
-11. Monitor repeated daemon errors, retry backlog, exhausted classification attempts, and API health check failures.
+10. Confirm the classification worker logs show batch counts, queue counters, and no raw customer message text. If CRM sync is intentionally active, confirm the CRM worker logs also show retry/backoff visibility.
+11. Monitor repeated daemon errors, exhausted classification attempts, and API health check failures. Monitor CRM retry backlog only when CRM sync is active.
 
 Do not use `docker compose config` without `--quiet` in environments with real secrets; the non-quiet command prints resolved environment values.
 
