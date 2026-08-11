@@ -332,13 +332,15 @@ The CRM retry daemon atomically claims classified leads whose `integration_next_
 
 ### Deployment Status and Production Scope
 
-Production was verified on August 11, 2026. The Render Starter API at `https://lead-triage.onrender.com` and the `lead-triage-worker` classification service are deployed in Oregon from commit `9205b29`. `GET /health` returned HTTP `200` with `status=ok` and `environment=production`. This proves process availability; database migrations, queue health, and an end-to-end lead classification still require authenticated production checks.
+Production was checked on August 11, 2026. The Render Starter API at `https://lead-triage.onrender.com` and the `lead-triage-worker` classification service are deployed in Oregon from commit `9205b29`. `GET /health` and `GET /health/database` returned HTTP `200`, proving process and database connectivity.
 
-The Render dashboard currently shows Auto-Deploy **On Commit** for the existing services. The GitHub Actions workflow and CI-gated Blueprint are still uncommitted local changes, so the live deployment is not yet protected by required CI checks.
+The production write path is currently **degraded**. Two authorized synthetic intake attempts returned HTTP `503` with `Lead persistence failed`; Render recorded the sanitized failure category `LeadInsertFailed`. Neither attempt created a lead, so classification could not start, and the monitored queue remained empty. Treat production as **no-go for promotion** until persistence is repaired and an end-to-end synthetic lead passes intake, persistence, classification, and queue monitoring.
+
+The Render dashboard now requires **After CI Checks Pass** for both existing services. The GitHub Actions workflow is under review in PR #1. The Blueprint preview matched exactly the existing `lead-triage` web service and `lead-triage-worker`; it remains unapplied until the review branch is merged to `main`.
 
 The supported production scope intentionally leaves CRM auto-sync inactive until a CRM provider or signed-webhook destination is selected, so no CRM retry worker is deployed. This is a deliberate scope decision, not a pipeline defect.
 
-The core pipeline remains fully operational without CRM delivery:
+The core pipeline is designed to operate without CRM delivery once the current production persistence failure is resolved:
 
 `intake API -> Supabase persistence -> classification worker -> admin dashboard`
 
