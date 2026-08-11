@@ -36,13 +36,12 @@ class TestDockerfile:
 
     @pytest.mark.unit
     def test_default_command_runs_fastapi_server(self):
-        """Test default container command serves the FastAPI app."""
+        """Test default container command serves FastAPI on the platform port."""
         dockerfile = read_project_file("Dockerfile")
 
-        assert (
-            'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", '
-            '"--port", "8000", "--no-proxy-headers"]'
-        ) in dockerfile
+        assert 'CMD ["sh", "-c", "exec uvicorn app.main:app' in dockerfile
+        assert '--host 0.0.0.0 --port \\"${PORT:-8000}\\"' in dockerfile
+        assert '--no-proxy-headers"]' in dockerfile
 
 
 class TestDockerCompose:
@@ -110,3 +109,15 @@ class TestDockerIgnore:
         assert ".env" in dockerignore.splitlines()
         assert ".env.*" in dockerignore.splitlines()
         assert "!.env.example" in dockerignore.splitlines()
+
+
+class TestExampleEnvironment:
+    """Example environment compatibility checks."""
+
+    @pytest.mark.unit
+    def test_dedup_strategy_is_valid_for_docker_env_file(self):
+        """Test Docker does not include an inline comment in the enum value."""
+        example = read_project_file(".env.example")
+
+        assert "DEDUP_STRATEGY=email\n" in example
+        assert "DEDUP_STRATEGY=email  #" not in example

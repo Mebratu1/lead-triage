@@ -20,6 +20,8 @@ LeadTriage is a FastAPI backend portfolio project for an AI-assisted lead classi
 - Signed CRM webhook delivery, opt-in HubSpot contact mapping, concurrent retry processing, and filtered CSV export
 - Signed worker alert routing for stalled queues, high error rates, and repeated batch crashes
 - Split admin/monitoring credentials, public intake limits, safe retry visibility, and sanitized health logs
+- GitHub Actions CI for Python 3.12 tests, lint, Compose validation, and production-image builds
+- Render Blueprint for the API and active classification worker, gated on passing CI
 
 ## Runtime
 
@@ -225,6 +227,8 @@ Apply migrations in order:
 5. `app/db/migrations/005_classification_claim_retry.sql` adds worker claim ownership, attempt counts, retry backoff, indexes, and the atomic claim RPC.
 6. `app/db/migrations/006_integration_sync_tracking.sql` adds outbound CRM sync status, last sync timestamp, sanitized error, retry timestamp, constraints, and indexes.
 7. `app/db/migrations/007_crm_retry_claiming.sql` adds CRM retry attempt and claim ownership fields, a due-retry index, and the atomic `claim_due_leads_for_crm_sync` RPC.
+8. `app/db/migrations/008_enforce_integration_claim_status.sql` requires active CRM retry claims to belong only to leads whose integration status is `failed`.
+9. `app/db/migrations/009_drop_integration_next_attempt_default.sql` removes the unintended retry timestamp default so new leads keep `integration_next_attempt_at = NULL` unless retry scheduling sets it explicitly.
 
 - `id`
 - `idempotency_key`
@@ -328,11 +332,17 @@ The daemon handles `SIGINT` and `SIGTERM` gracefully: an active batch is allowed
 
 The CRM retry daemon atomically claims classified leads whose `integration_next_attempt_at` is due. `FOR UPDATE SKIP LOCKED`, claim ownership, and stale-claim recovery prevent two workers from owning the same database item. The external receiver must still honor `Idempotency-Key` because a network response can be lost after the receiver commits.
 
-### Current Production Scope
+### Deployment Status and Production Scope
 
-CRM auto-sync is intentionally **not active** in the current production deployment. No CRM provider or signed-webhook destination has been selected, so no CRM retry worker is deployed. This is a deliberate scope decision, not a pipeline defect.
+Production was checked on August 11, 2026. The Render Starter API at `https://lead-triage.onrender.com` and the `lead-triage-worker` classification service are deployed in Oregon. `GET /health` and `GET /health/database` returned HTTP `200`, proving process and database connectivity.
 
-The core pipeline remains fully operational without CRM delivery:
+Production intake was confirmed working after migration `009` removed the unintended `integration_next_attempt_at` default. An authorized synthetic lead returned HTTP `201`, persisted successfully, and was classified by `lead-triage-worker` on its first attempt. A read-only production query confirmed the classification result; the specific synthetic row was then deleted, and a final read-only query confirmed that no test row remained.
+
+The Render dashboard now requires **After CI Checks Pass** for both existing services. The GitHub Actions workflow is under review in PR #1. The Blueprint preview matched exactly the existing `lead-triage` web service and `lead-triage-worker`; it remains unapplied until the review branch is merged to `main`.
+
+The supported production scope intentionally leaves CRM auto-sync inactive until a CRM provider or signed-webhook destination is selected, so no CRM retry worker is deployed. This is a deliberate scope decision, not a pipeline defect.
+
+The verified core pipeline operates without CRM delivery:
 
 `intake API -> Supabase persistence -> classification worker -> admin dashboard`
 
@@ -502,7 +512,7 @@ DEDUP_WINDOW_DAYS=7
 
 ### Production Database Constraints
 
-Before deploying API or worker containers, apply Supabase migrations `001` through `007` in order and verify these database safeguards exist:
+Before deploying API or worker containers, apply Supabase migrations `001` through `009` in order and verify these database safeguards exist:
 
 - `raw_message`, `source`, `classification_status`, `idempotency_key`, and `deduplication_bucket` support intake persistence.
 - The unique index on `(idempotency_key, deduplication_bucket)` prevents duplicate lead inserts inside the configured deduplication bucket.
@@ -574,48 +584,38 @@ Use three runtime services from the same Docker image:
 
 | Service | Public | Command |
 | --- | --- | --- |
-| API | Yes | `uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers` |
+| API | Yes | Dockerfile default; binds to Render's `PORT` with local fallback `8000` |
 | Classification worker | No | `python -m app.jobs.classification_daemon --worker-id <stable-worker-id> --limit 10 --sleep-seconds 30` |
-| CRM sync worker | No | `python -m app.jobs.crm_sync_daemon --worker-id <stable-crm-worker-id> --limit 10 --sleep-seconds 30` |
+| CRM sync worker | No | Deferred; add only after selecting and configuring a CRM provider |
 
-The API service must expose container port `8000`. Neither worker should expose an HTTP port.
+The API must bind to the platform-provided `PORT`; it falls back to `8000` for local Docker and Compose use. Neither worker should expose an HTTP port.
 
 #### Render Deployment
 
 Official references: [Docker on Render](https://render.com/docs/docker), [Render web services](https://render.com/docs/web-services), [Render background workers](https://render.com/docs/background-workers), and [Render health checks](https://render.com/docs/health-checks).
 
-1. Push the repository to GitHub, GitLab, or Bitbucket.
-2. In Render, create a new Web Service from the repository.
-3. Set the runtime/language to Docker and keep the Dockerfile path as `Dockerfile`.
-4. Configure the API service:
-   - Name: `lead-triage-api`
-   - Docker command: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers`
-   - Port: `8000`
-   - Health check path: `/health`
-   - Environment variables: all required production variables from the table above
-5. Create two Background Workers from the same repository and Dockerfile.
-6. Configure the classification worker service:
-   - Name: `lead-triage-worker`
-   - Docker command: `python -m app.jobs.classification_daemon --worker-id render-worker-1 --limit 10 --sleep-seconds 30`
-   - Environment variables: same production variables as the API service
-   - Instances: start with `1` worker until queue metrics show sustained backlog
-7. Configure the CRM sync worker service:
-   - Name: `lead-triage-crm-sync-worker`
-   - Docker command: `python -m app.jobs.crm_sync_daemon --worker-id render-crm-worker-1 --limit 10 --sleep-seconds 30`
-   - Environment variables: same production variables as the API service
-   - Instances: start with `1` worker
-8. Deploy the API first, then both workers.
-9. Run smoke checks:
+The repository's `render.yaml` is the preferred infrastructure definition. It matches the two existing billable Starter services in Oregon: `lead-triage` and `lead-triage-worker`. It deliberately excludes Render Postgres and the deferred CRM worker, declares deploys only after GitHub CI passes, and disables preview environments to avoid accidental compute charges. These controls do not affect the live services until the file is committed and the Blueprint is attached in Render.
+
+Before attaching the Blueprint to the existing production services:
+
+1. Keep both service names and `region: oregon` unchanged. They match the existing services; changing them can create duplicate billable services instead of managing production.
+2. Apply Supabase migrations `001` through `009` manually and verify them before starting either service.
+3. In the Render Dashboard, create a Blueprint from this repository and inspect its proposed plan before applying it.
+4. Supply the prompted `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and `ALLOWED_ORIGINS` values. Render generates the admin, monitoring, and JWT secrets and shares all required values with the worker through service references.
+5. Continue only if the plan updates exactly `lead-triage` and `lead-triage-worker`. Abort if it proposes additional services or a database.
+6. Keep `TRUSTED_PROXY_CIDRS=[]` for the first deploy. Verify the socket peer and forwarding headers in the deployed environment before trusting any proxy CIDR; never use `0.0.0.0/0` as a trusted proxy range.
+7. Allow the CI checks and both Render deploys to complete, then run smoke checks:
 
 ```powershell
-Invoke-RestMethod https://<api-host>/health
-Invoke-RestMethod https://<api-host>/health/database
+Invoke-RestMethod https://lead-triage.onrender.com/health
+Invoke-RestMethod https://lead-triage.onrender.com/health/database
 
 $headers = @{ Authorization = "Bearer $env:QUEUE_METRICS_TOKEN" }
-Invoke-RestMethod -Uri https://<api-host>/health/queue -Headers $headers
+Invoke-RestMethod -Uri https://lead-triage.onrender.com/health/queue -Headers $headers
 ```
 
-10. Submit one test lead to `POST /api/leads`, confirm it returns `201` or `200`, then confirm the classification worker eventually reduces `pending_count`.
+8. Submit one test lead to `POST /api/leads`, confirm it returns `201` or `200`, then confirm the classification worker eventually reduces `pending_count`.
+9. Add `lead-triage-crm-sync-worker` later only after a CRM provider decision, configuration, and end-to-end delivery test.
 
 #### Fly.io Deployment Notes
 
@@ -642,7 +642,7 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 
 ### Deployment Checklist
 
-1. Apply Supabase migrations `001` through `008` in order.
+1. Apply Supabase migrations `001` through `009` in order.
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Confirm `OPENAI_API_KEY` is available only to server containers.
 4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
@@ -657,6 +657,8 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 Do not use `docker compose config` without `--quiet` in environments with real secrets; the non-quiet command prints resolved environment values.
 
 ## Development Verification
+
+GitHub Actions runs the Python 3.12 test and lint suite with a 90% application-coverage floor, validates the Compose configuration with placeholder values from `.env.example`, and builds and health-checks the production image on a platform-style port on pushes to `main` and pull requests. The workflow uses read-only repository permissions and does not receive application secrets.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -ra -W default
@@ -695,4 +697,4 @@ Next implementation work should add, in order:
 
 1. Additional provider-specific CRM adapters and mappings beyond HubSpot contacts
 2. Persistent incident state or external supervision for crash detection across process restarts
-3. Deployment automation and external runtime supervision
+3. Provider-specific deployment automation and external runtime supervision

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Test
+        run: >-
+          python -m pytest
+          --cov=app
+          --cov-report=term-missing:skip-covered
+          --cov-fail-under=90
+          -q
+
+  container:
+    name: Container verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Create safe Compose environment
+        run: cp .env.example .env
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build production image
+        run: docker build --tag lead-triage:ci .
+
+      - name: Smoke-test production image on platform port
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name=lead-triage-ci-smoke
+          trap 'docker rm --force "$container_name" >/dev/null 2>&1 || true' EXIT
+
+          docker run --detach \
+            --name "$container_name" \
+            --env-file .env.example \
+            --env PORT=10000 \
+            lead-triage:ci
+
+          for _ in {1..30}; do
+            if response=$(docker exec "$container_name" python -c \
+              "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:10000/health', timeout=2).read().decode())" \
+              2>/dev/null); then
+              echo "$response"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs "$container_name"
+          exit 1

@@ -1,0 +1,118 @@
+previews:
+  generation: "off"
+
+services:
+  # These names and the Oregon region match the existing production services.
+  # Changing them can create duplicate billable services instead of updating
+  # the current deployment.
+  - type: web
+    name: lead-triage
+    runtime: docker
+    plan: starter
+    region: oregon
+    numInstances: 1
+    autoDeployTrigger: checksPass
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: OPENAI_MODEL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: QUEUE_METRICS_TOKEN
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      # Safe default: do not trust forwarding headers until the deployed
+      # socket peer and Render's header behavior have been verified.
+      - key: TRUSTED_PROXY_CIDRS
+        value: "[]"
+
+  - type: worker
+    name: lead-triage-worker
+    runtime: docker
+    plan: starter
+    region: oregon
+    numInstances: 1
+    autoDeployTrigger: checksPass
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: >-
+      python -m app.jobs.classification_daemon
+      --worker-id render-worker-1
+      --limit 10
+      --sleep-seconds 30
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: TRUSTED_PROXY_CIDRS
+        value: "[]"
+      - key: SUPABASE_URL
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: SUPABASE_URL
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: SUPABASE_SERVICE_ROLE_KEY
+      - key: OPENAI_API_KEY
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: OPENAI_API_KEY
+      - key: OPENAI_MODEL
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: OPENAI_MODEL
+      - key: ALLOWED_ORIGINS
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: ALLOWED_ORIGINS
+      - key: ADMIN_TOKEN
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: ADMIN_TOKEN
+      - key: QUEUE_METRICS_TOKEN
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: QUEUE_METRICS_TOKEN
+      - key: JWT_SECRET
+        fromService:
+          type: web
+          name: lead-triage
+          envVarKey: JWT_SECRET
