@@ -227,6 +227,8 @@ Apply migrations in order:
 5. `app/db/migrations/005_classification_claim_retry.sql` adds worker claim ownership, attempt counts, retry backoff, indexes, and the atomic claim RPC.
 6. `app/db/migrations/006_integration_sync_tracking.sql` adds outbound CRM sync status, last sync timestamp, sanitized error, retry timestamp, constraints, and indexes.
 7. `app/db/migrations/007_crm_retry_claiming.sql` adds CRM retry attempt and claim ownership fields, a due-retry index, and the atomic `claim_due_leads_for_crm_sync` RPC.
+8. `app/db/migrations/008_enforce_integration_claim_status.sql` requires active CRM retry claims to belong only to leads whose integration status is `failed`.
+9. `app/db/migrations/009_drop_integration_next_attempt_default.sql` removes the unintended retry timestamp default so new leads keep `integration_next_attempt_at = NULL` unless retry scheduling sets it explicitly.
 
 - `id`
 - `idempotency_key`
@@ -332,15 +334,15 @@ The CRM retry daemon atomically claims classified leads whose `integration_next_
 
 ### Deployment Status and Production Scope
 
-Production was checked on August 11, 2026. The Render Starter API at `https://lead-triage.onrender.com` and the `lead-triage-worker` classification service are deployed in Oregon from commit `9205b29`. `GET /health` and `GET /health/database` returned HTTP `200`, proving process and database connectivity.
+Production was checked on August 11, 2026. The Render Starter API at `https://lead-triage.onrender.com` and the `lead-triage-worker` classification service are deployed in Oregon. `GET /health` and `GET /health/database` returned HTTP `200`, proving process and database connectivity.
 
-The production write path is currently **degraded**. Two authorized synthetic intake attempts returned HTTP `503` with `Lead persistence failed`; Render recorded the sanitized failure category `LeadInsertFailed`. Neither attempt created a lead, so classification could not start, and the monitored queue remained empty. Treat production as **no-go for promotion** until persistence is repaired and an end-to-end synthetic lead passes intake, persistence, classification, and queue monitoring.
+Production intake was confirmed working after migration `009` removed the unintended `integration_next_attempt_at` default. An authorized synthetic lead returned HTTP `201`, persisted successfully, and was classified by `lead-triage-worker` on its first attempt. A read-only production query confirmed the classification result; the specific synthetic row was then deleted, and a final read-only query confirmed that no test row remained.
 
 The Render dashboard now requires **After CI Checks Pass** for both existing services. The GitHub Actions workflow is under review in PR #1. The Blueprint preview matched exactly the existing `lead-triage` web service and `lead-triage-worker`; it remains unapplied until the review branch is merged to `main`.
 
 The supported production scope intentionally leaves CRM auto-sync inactive until a CRM provider or signed-webhook destination is selected, so no CRM retry worker is deployed. This is a deliberate scope decision, not a pipeline defect.
 
-The core pipeline is designed to operate without CRM delivery once the current production persistence failure is resolved:
+The verified core pipeline operates without CRM delivery:
 
 `intake API -> Supabase persistence -> classification worker -> admin dashboard`
 
@@ -510,7 +512,7 @@ DEDUP_WINDOW_DAYS=7
 
 ### Production Database Constraints
 
-Before deploying API or worker containers, apply Supabase migrations `001` through `008` in order and verify these database safeguards exist:
+Before deploying API or worker containers, apply Supabase migrations `001` through `009` in order and verify these database safeguards exist:
 
 - `raw_message`, `source`, `classification_status`, `idempotency_key`, and `deduplication_bucket` support intake persistence.
 - The unique index on `(idempotency_key, deduplication_bucket)` prevents duplicate lead inserts inside the configured deduplication bucket.
@@ -597,7 +599,7 @@ The repository's `render.yaml` is the preferred infrastructure definition. It ma
 Before attaching the Blueprint to the existing production services:
 
 1. Keep both service names and `region: oregon` unchanged. They match the existing services; changing them can create duplicate billable services instead of managing production.
-2. Apply Supabase migrations `001` through `008` manually and verify them before starting either service.
+2. Apply Supabase migrations `001` through `009` manually and verify them before starting either service.
 3. In the Render Dashboard, create a Blueprint from this repository and inspect its proposed plan before applying it.
 4. Supply the prompted `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and `ALLOWED_ORIGINS` values. Render generates the admin, monitoring, and JWT secrets and shares all required values with the worker through service references.
 5. Continue only if the plan updates exactly `lead-triage` and `lead-triage-worker`. Abort if it proposes additional services or a database.
@@ -640,7 +642,7 @@ Official references: [Railway variables](https://docs.railway.com/variables) and
 
 ### Deployment Checklist
 
-1. Apply Supabase migrations `001` through `008` in order.
+1. Apply Supabase migrations `001` through `009` in order.
 2. Confirm `SUPABASE_SERVICE_ROLE_KEY` is available only to server containers.
 3. Confirm `OPENAI_API_KEY` is available only to server containers.
 4. Set `ENVIRONMENT=production`, `APP_ENV=production`, `DEBUG=false`, and explicit `ALLOWED_ORIGINS`.
