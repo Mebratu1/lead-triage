@@ -161,6 +161,9 @@ class FakeLeadDatabase:
             "source": payload["source"],
             "raw_message": payload["raw_message"],
             "classification_status": payload["classification_status"],
+            "integration_next_attempt_at": payload.get(
+                "integration_next_attempt_at"
+            ),
             "created_at": created_at,
         }
 
@@ -319,6 +322,28 @@ class TestLeadPersistenceContract:
                 "classification_status": "pending",
             }
         ]
+
+    @pytest.mark.unit
+    def test_create_lead_leaves_integration_retry_timestamp_null_by_default(
+        self,
+        client: TestClient,
+    ):
+        """Test a new lead has no scheduled CRM retry until explicitly set."""
+        database = FakeLeadDatabase()
+
+        response = post_lead(
+            client,
+            database,
+            {
+                "source": "website",
+                "message": "Please schedule a plumbing estimate for next week.",
+            },
+        )
+
+        assert response.status_code == 201
+        assert "integration_next_attempt_at" not in database.inserted_payloads[0]
+        inserted_row = next(iter(database.records_by_key.values()))
+        assert inserted_row["integration_next_attempt_at"] is None
 
     @pytest.mark.unit
     def test_create_lead_returns_exact_duplicate_with_200(self, client: TestClient):

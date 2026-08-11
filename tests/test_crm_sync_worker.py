@@ -376,3 +376,27 @@ def test_crm_retry_migration_uses_skip_locked_and_due_timestamp():
     assert "integration_retry_attempt_count >= p_max_attempts" in migration
     assert "integration_error = 'crm_retry_exhausted'" in migration
     assert "FROM PUBLIC" in migration
+
+
+@pytest.mark.unit
+def test_migration_009_drops_integration_next_attempt_default():
+    """Test new leads receive NULL until a CRM retry is explicitly scheduled."""
+    from pathlib import Path
+
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "db"
+        / "migrations"
+        / "009_drop_integration_next_attempt_default.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "SELECT column_name, column_default, is_nullable" in migration
+    assert "FROM information_schema.columns" in migration
+    assert "BEGIN;" in migration
+    assert (
+        "ALTER COLUMN integration_next_attempt_at DROP DEFAULT;" in migration
+    )
+    assert "COMMIT;" in migration
+    assert migration.index("BEGIN;") < migration.index("ALTER TABLE leads")
+    assert migration.index("ALTER TABLE leads") < migration.index("COMMIT;")
